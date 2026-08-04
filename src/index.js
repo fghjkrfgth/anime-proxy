@@ -1,105 +1,125 @@
-export default {
-    async fetch(request, env, ctx) {
-        // 1. Handle CORS Preflight (OPTIONS)
-        if (request.method === "OPTIONS") {
-            return new Response(null, {
-                status: 204,
-                headers: {
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age": "86400",
-                },
-            });
-        }
+// -------------------------------------------------------------------------
+// CLOUDFLARE WORKER ROUTER & PROXY ENGINE
+// -------------------------------------------------------------------------
 
-        const url = new URL(request.url);
+addEventListener("fetch", (event) => {
+  event.respondWith(handleRequest(event));
+});
 
-        // 2. Extract target destination from target parameter (e.g., ?src=https://...)
-        const targetUrlStr = url.searchParams.get("src") || url.searchParams.get("url");
-
-        if (!targetUrlStr) {
-            return new Response("Invalid request context", { status: 400 });
-        }
-
-        let targetUrl;
-        try {
-            targetUrl = new URL(targetUrlStr);
-        } catch (e) {
-            return new Response("Invalid target URL", { status: 400 });
-        }
-
-        // 3. Setup Cache Engine Key
-        const cacheKey = new Request(url.toString(), request);
-        const cache = caches.default;
-
-        // Check if item exists in 30-day edge cache
-        let response = await cache.match(cacheKey);
-
-        if (response) {
-            // CACHE HIT: Re-save asynchronously to RESET the 30-day (2,592,000s) TTL timer
-            const clonedResponse = response.clone();
-            ctx.waitUntil(
-                (async () => {
-                    const newHeaders = new Headers(clonedResponse.headers);
-                    newHeaders.set("Cache-Control", "public, max-age=2592000");
-                    const refreshedResponse = new Response(clonedResponse.body, {
-                        status: clonedResponse.status,
-                        statusText: clonedResponse.statusText,
-                        headers: newHeaders,
-                    });
-                    await cache.put(cacheKey, refreshedResponse);
-                })()
-            );
-
-            // Return response with CORS headers injected
-            return addCorsHeaders(response);
-        }
-
-        // 4. CACHE MISS: Prepare upstream request
-        const clientUserAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-        
-        const upstreamHeaders = new Headers();
-        upstreamHeaders.set("User-Agent", clientUserAgent);
-        upstreamHeaders.set("Accept", "application/json, text/html, */*");
-        if (request.headers.get("Accept-Language")) {
-            upstreamHeaders.set("Accept-Language", request.headers.get("Accept-Language"));
-        }
-
-        try {
-            const upstreamResponse = await fetch(targetUrl.toString(), {
-                method: request.method,
-                headers: upstreamHeaders,
-            });
-
-            // Re-build response with 30-day Cache-Control header
-            const responseHeaders = new Headers(upstreamResponse.headers);
-            responseHeaders.set("Cache-Control", "public, max-age=2592000");
-            responseHeaders.set("Access-Control-Allow-Origin", "*");
-
-            const newResponse = new Response(upstreamResponse.body, {
-                status: upstreamResponse.status,
-                statusText: upstreamResponse.statusText,
-                headers: responseHeaders,
-            });
-
-            // Store in Cache Engine asynchronously
-            ctx.waitUntil(cache.put(cacheKey, newResponse.clone()));
-
-            return newResponse;
-        } catch (err) {
-            return new Response("Gateway response error", { status: 502 });
-        }
-    }
-};
-
-// Helper function to attach open CORS headers
-function addCorsHeaders(response) {
-    const newHeaders = new Headers(response.headers);
-    newHeaders.set("Access-Control-Allow-Origin", "*");
-    return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
+async function handleRequest(event) {
+  const request = event.request;
+  const url = new URL(request.url);
+  
+  // 1. CORS Preflight & Handshake
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Accept, User-Agent",
+        "Access-Control-Max-Age": "86400",
+      },
     });
+  }
+
+  // 2. Extract upstream destination target
+  const srcUrl = url.searchParams.get("src");
+  if (!srcUrl) {
+    return new Response(JSON.stringify({ error: "Missing 'src' target URL" }), {
+      status: 400,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
+  // 3. Cache read initialization (caches.default is Cloudflare-specific)
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  const cacheKey = request.clone();
+  let cachedResponse = null;
+  
+  if (cache) {
+    try {
+      cachedResponse = await cache.match(cacheKey);
+    } catch (e) {
+      console.warn("[Worker Cache] Match error:", e);
+    }
+  }
+
+  if (cachedResponse) {
+    const headers = new Headers(cachedResponse.headers);
+    headers.set("Access-Control-Allow-Origin", "*");
+    return new Response(cachedResponse.body, {
+      status: cachedResponse.status,
+      statusText: cachedResponse.statusText,
+      headers,
+    });
+  }
+
+  // 4. Construct Upstream request headers
+  const headers = new Headers();
+  
+  // Forward real User-Agent from client or simulate a modern Chrome client
+  let userAgent = request.headers.get("User-Agent");
+  if (!userAgent) {
+    userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+  }
+  headers.set("User-Agent", userAgent);
+
+  // Forward Content-Type & Accept headers if specified
+  const contentType = request.headers.get("Content-Type");
+  if (contentType) {
+    headers.set("Content-Type", contentType);
+  }
+  
+  const accept = request.headers.get("Accept");
+  if (accept) {
+    headers.set("Accept", accept);
+  }
+
+  const fetchOptions = {
+    method: request.method,
+    headers: headers,
+  };
+
+  // 5. Read and forward body payload for POST requests (e.g. GraphQL calls)
+  if (request.method === "POST" || request.method === "PUT") {
+    fetchOptions.body = await request.text();
+  }
+
+  try {
+    const upstreamResponse = await fetch(srcUrl, fetchOptions);
+    
+    // Build new response appending CORS headers
+    const responseHeaders = new Headers(upstreamResponse.headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    
+    const modifiedResponse = new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers: responseHeaders,
+    });
+
+    // 6. Selective Caching: ONLY cache successful HTTP 200 GET requests
+    // Exclude 403 (Forbidden), 404, or any other client/server error codes
+    if (cache && upstreamResponse.status === 200 && request.method === "GET") {
+      try {
+        event.waitUntil(cache.put(cacheKey, modifiedResponse.clone()));
+      } catch (e) {
+        console.warn("[Worker Cache] Put error:", e);
+      }
+    }
+
+    return modifiedResponse;
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
 }
