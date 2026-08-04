@@ -58,7 +58,7 @@ async function handleRequest(event) {
     });
   }
 
-  // 4. Construct Upstream request headers
+  // 4. Construct Upstream request headers (Omit cf-connecting-ip, x-forwarded-for, etc.)
   const headers = new Headers();
   
   // Forward real User-Agent from client or simulate a modern Chrome client
@@ -68,15 +68,24 @@ async function handleRequest(event) {
   }
   headers.set("User-Agent", userAgent);
 
-  // Forward Content-Type & Accept headers if specified
-  const contentType = request.headers.get("Content-Type");
-  if (contentType) {
-    headers.set("Content-Type", contentType);
+  // Set Origin and Referer for AniList to spoof first-party requests
+  if (srcUrl.includes("graphql.anilist.co")) {
+    headers.set("Origin", "https://anilist.co");
+    headers.set("Referer", "https://anilist.co/");
+    headers.set("Accept", "application/json, text/plain, */*");
+    headers.set("Accept-Language", "en-US,en;q=0.9");
+  } else {
+    // For non-AniList requests, forward client Accept header if present
+    const accept = request.headers.get("Accept");
+    if (accept) {
+      headers.set("Accept", accept);
+    }
   }
-  
-  const accept = request.headers.get("Accept");
-  if (accept) {
-    headers.set("Accept", accept);
+
+  // Forward Content-Type for POST/PUT requests
+  if (request.method === "POST" || request.method === "PUT") {
+    const contentType = request.headers.get("Content-Type") || "application/json";
+    headers.set("Content-Type", contentType);
   }
 
   const fetchOptions = {
