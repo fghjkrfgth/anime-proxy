@@ -27,23 +27,22 @@ async function handleRequest(event) {
   // Define client User-Agent
   let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
-  // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (anikototv.to)
+  // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (/schedule)
   const action = url.searchParams.get("action");
-  if (action === "schedule") {
+  if (action === "schedule" || url.pathname === "/schedule") {
     return await handleScheduleRequest(url);
   }
 
-  // 3. ROUTING PIPELINE: Franchise Tree Proxy (/api/franchise or action=franchise)
-  if (url.pathname === "/api/franchise" || action === "franchise") {
-    const slug = url.searchParams.get("slug");
-    const id = url.searchParams.get("id") || url.searchParams.get("anilistId");
+  // 3. OBFUSCATED ROUTE: Franchise Tree (/comment?s={slug}&id={anilistId})
+  if (url.pathname === "/comment" || action === "comment" || url.pathname === "/api/franchise" || action === "franchise") {
+    const slug = url.searchParams.get("s") || url.searchParams.get("slug");
+    const id = url.searchParams.get("id") || url.searchParams.get("anilistId") || url.searchParams.get("anilist_id");
     return await handleFranchiseRequest(slug, id, userAgent);
   }
 
-  // 4. ROUTING PIPELINE: Streaming Resolution (megaplay.buzz)
-  const anilistId = url.searchParams.get("anilist_id") || url.searchParams.get("id");
-  const epNum = url.searchParams.get("ep_num") || url.searchParams.get("ep");
-  if (anilistId && epNum) {
+  // 4. OBFUSCATED ROUTE: Media & Stream Resolution (/rating?e={episodeId}&id={anilistId}&lang={lang})
+  const hasStreamParams = url.searchParams.has("e") || url.searchParams.has("ep_num") || url.searchParams.has("ep") || url.searchParams.has("episodeId");
+  if (url.pathname === "/rating" || action === "rating" || url.pathname === "/api/stream" || url.pathname === "/api/media" || (hasStreamParams && action !== "proxy_caption" && action !== "schedule")) {
     return await handleStreamRequest(url, request);
   }
 
@@ -630,12 +629,12 @@ function parseMasterM3u8(masterText, masterUrl) {
 }
 
 // -------------------------------------------------------------------------
-// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
+// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER (/rating)
 // -------------------------------------------------------------------------
 async function handleStreamRequest(url, request) {
-  const anilistId = url.searchParams.get("anilist_id") || url.searchParams.get("id");
-  const epNum = url.searchParams.get("ep_num") || url.searchParams.get("ep") || "1";
-  const language = url.searchParams.get("language") || url.searchParams.get("lang") || "sub";
+  const anilistId = url.searchParams.get("id") || url.searchParams.get("anilist_id") || url.searchParams.get("anilistId");
+  const epNum = url.searchParams.get("e") || url.searchParams.get("ep_num") || url.searchParams.get("ep") || url.searchParams.get("episodeId") || "1";
+  const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
   
   const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -862,11 +861,11 @@ async function handleStreamRequest(url, request) {
 }
 
 // -------------------------------------------------------------------------
-// FRANCHISE TREE FETCH & SVELTEKIT JSON DE-SERIALIZATION ENGINE
+// FRANCHISE TREE FETCH & SVELTEKIT JSON DE-SERIALIZATION ENGINE (/comment)
 // -------------------------------------------------------------------------
 async function handleFranchiseRequest(slug, id, userAgent) {
   if (!slug || !id) {
-    return new Response(JSON.stringify({ error: "Missing slug or id parameter", seasons: [] }), {
+    return new Response(JSON.stringify({ error: "Missing parameter", seasons: [] }), {
       status: 400,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     });
