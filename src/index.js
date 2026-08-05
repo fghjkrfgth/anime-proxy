@@ -650,7 +650,7 @@ async function handleStreamRequest(url, request) {
   // Step 3: Fetch playlist text from CDN and rewrite
   const manifestRes = await fetch(m3u8Url, {
     headers: {
-      'Referer': 'https://megaplay.buzz/',
+      'Referer': 'https://megaplay.buzz',
       'User-Agent': userAgent
     }
   });
