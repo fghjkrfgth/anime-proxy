@@ -10,14 +10,15 @@ async function handleRequest(event) {
   const request = event.request;
   const url = new URL(request.url);
   
-  // 1. CORS Preflight & Handshake
+  // 1. UNIVERSAL OPTIONS PREFLIGHT HANDLER
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Accept, User-Agent, X-Requested-With, Origin, Referer",
+        "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
         "Access-Control-Max-Age": "86400",
       },
     });
@@ -119,28 +120,47 @@ async function handleRequest(event) {
 
   // Construct request headers for upstream target forwarding
   const headers = new Headers();
-  headers.set("User-Agent", userAgent);
 
+  const lowerSrcUrl = srcUrl.toLowerCase();
   const isCdnTarget = 
+    srcUrl.includes("cloudbuzz.lol") ||
     srcUrl.includes("sugevideo.xyz") ||
     srcUrl.includes("mewstream.buzz") ||
     srcUrl.includes("megaplay.buzz") ||
-    srcUrl.toLowerCase().includes(".m3u8") || 
-    srcUrl.toLowerCase().includes(".ts") || 
-    srcUrl.toLowerCase().includes(".jpg") || 
-    srcUrl.toLowerCase().includes(".png");
+    lowerSrcUrl.includes(".html") || 
+    lowerSrcUrl.includes(".m3u8") || 
+    lowerSrcUrl.includes(".ts") || 
+    lowerSrcUrl.includes(".jpg") || 
+    lowerSrcUrl.includes(".jpeg") ||
+    lowerSrcUrl.includes(".png") ||
+    lowerSrcUrl.includes(".m4s") ||
+    lowerSrcUrl.includes(".mp4");
 
   if (isCdnTarget) {
     headers.set("Referer", "https://megaplay.buzz/");
     headers.set("Origin", "https://megaplay.buzz");
+    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
+    headers.set("Accept", "*/*");
+    headers.set("Accept-Language", "en-US,en;q=0.9");
+    headers.set("Sec-Fetch-Dest", "empty");
+    headers.set("Sec-Fetch-Mode", "cors");
+    headers.set("Sec-Fetch-Site", "cross-site");
   } else if (srcUrl.includes("anikototv.to")) {
     headers.set("Referer", "https://anikototv.to/home");
     headers.set("Origin", "https://anikototv.to");
+    headers.set("User-Agent", userAgent);
   } else {
+    headers.set("User-Agent", userAgent);
     const origReferer = request.headers.get("Referer");
     if (origReferer) headers.set("Referer", origReferer);
     const origOrigin = request.headers.get("Origin");
     if (origOrigin) headers.set("Origin", origOrigin);
+  }
+
+  // Forward Range header if present for byte-range segment requests
+  const rangeHeader = request.headers.get("Range");
+  if (rangeHeader) {
+    headers.set("Range", rangeHeader);
   }
 
   const accept = request.headers.get("Accept");
@@ -174,6 +194,9 @@ async function handleRequest(event) {
       const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", "application/x-mpegURL");
       responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
       
       const modifiedResponse = new Response(rewritten, {
         status: 200,
@@ -191,9 +214,12 @@ async function handleRequest(event) {
       return modifiedResponse;
     }
 
-    // Direct proxy response (TS segments, keys, etc.)
+    // Direct proxy response (TS/HTML segments, keys, etc.)
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Headers", "*");
+    responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
     
     const modifiedResponse = new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
@@ -315,11 +341,11 @@ function findSkipTimesRecursive(arr, key) {
   return null;
 }
 
-// Helper: Manifest URL rewriter (Absolute CDN rewriting)
+// Helper: Manifest URL rewriter (Absolute CDN & Tag attribute rewriting)
 function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
   const parsedUrl = new URL(manifestUrl);
   const scheme = parsedUrl.protocol;
-  const host = parsedUrl.host; // Use the dynamic host of the original manifest URL to prevent path/domain mismatch
+  const host = parsedUrl.host;
   
   let path = parsedUrl.pathname;
   let baseDir = path.substring(0, path.lastIndexOf('/'));
@@ -338,34 +364,31 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
     const getProxyUrl = (targetUrl) => {
       return `${workerOrigin}/?src=${encodeURIComponent(targetUrl)}`;
     };
+
+    const toAbsoluteUrl = (relOrAbsUrl) => {
+      if (relOrAbsUrl.startsWith('http://') || relOrAbsUrl.startsWith('https://')) {
+        return relOrAbsUrl;
+      }
+      if (relOrAbsUrl.startsWith('/')) {
+        return originUrl + relOrAbsUrl;
+      }
+      return baseUrl + relOrAbsUrl;
+    };
     
     if (!trimmed.startsWith('#')) {
-      let absoluteUrl = trimmed;
-      if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-        if (trimmed.startsWith('/')) {
-          absoluteUrl = originUrl + trimmed;
-        } else {
-          absoluteUrl = baseUrl + trimmed;
-        }
-      }
+      const absoluteUrl = toAbsoluteUrl(trimmed);
       return getProxyUrl(absoluteUrl);
     } else {
-      const uriMatch = trimmed.match(/URI=["']([^"']+)["']/i);
-      if (uriMatch) {
-        const uri = uriMatch[1];
-        let absoluteUri = uri;
-        if (!uri.startsWith('http://') && !uri.startsWith('https://')) {
-          if (uri.startsWith('/')) {
-            absoluteUri = originUrl + uri;
-          } else {
-            absoluteUri = baseUrl + uri;
-          }
-        }
-        const newUri = getProxyUrl(absoluteUri);
-        // Replace ONLY within the URI="..." attribute block to prevent mangling directives like #EXT-X-KEY
-        return trimmed.replace(`URI="${uri}"`, `URI="${newUri}"`).replace(`URI='${uri}'`, `URI='${newUri}'`);
+      // Handles #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.
+      let updatedLine = trimmed;
+      const uriMatches = trimmed.matchAll(/URI=["']([^"']+)["']/g);
+      for (const match of uriMatches) {
+        const rawUri = match[1];
+        const absoluteUri = toAbsoluteUrl(rawUri);
+        const newProxyUri = getProxyUrl(absoluteUri);
+        updatedLine = updatedLine.replace(`URI="${rawUri}"`, `URI="${newProxyUri}"`).replace(`URI='${rawUri}'`, `URI='${newProxyUri}'`);
       }
-      return line;
+      return updatedLine;
     }
   });
   
