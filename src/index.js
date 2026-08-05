@@ -530,6 +530,71 @@ async function handleScheduleRequest(url) {
 // -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
 // -------------------------------------------------------------------------
+// Helper: Parse master manifest to find the highest quality stream
+function parseMasterM3u8(masterText, masterUrl) {
+  const lines = masterText.split('\n');
+  let bestBandwidth = -1;
+  let bestUrl = null;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+      const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+      
+      let nextUrl = null;
+      for (let j = i + 1; j < lines.length; j++) {
+        const subLine = lines[j].trim();
+        if (subLine && !subLine.startsWith('#')) {
+          nextUrl = subLine;
+          break;
+        }
+      }
+      if (nextUrl) {
+        if (bandwidth > bestBandwidth || bestUrl === null) {
+          bestBandwidth = bandwidth;
+          bestUrl = nextUrl;
+        }
+      }
+    }
+  }
+  
+  if (!bestUrl) {
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#')) {
+        bestUrl = trimmed;
+        break;
+      }
+    }
+  }
+  
+  if (!bestUrl) return null;
+  
+  const parsedUrl = new URL(masterUrl);
+  const scheme = parsedUrl.protocol;
+  const host = parsedUrl.host;
+  let path = parsedUrl.pathname;
+  let baseDir = path.substring(0, path.lastIndexOf('/'));
+  if (baseDir === '' || baseDir === '/') {
+    baseDir = '';
+  }
+  const baseUrl = `${scheme}//${host}${baseDir}/`;
+  const originUrl = `${scheme}//${host}`;
+  
+  if (!bestUrl.startsWith('http://') && !bestUrl.startsWith('https://')) {
+    if (bestUrl.startsWith('/')) {
+      return originUrl + bestUrl;
+    } else {
+      return baseUrl + bestUrl;
+    }
+  }
+  return bestUrl;
+}
+
+// -------------------------------------------------------------------------
+// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
+// -------------------------------------------------------------------------
 async function handleStreamRequest(url, request) {
   const anilistId = url.searchParams.get("anilist_id") || url.searchParams.get("id");
   const epNum = url.searchParams.get("ep_num") || url.searchParams.get("ep") || "1";
@@ -646,8 +711,8 @@ async function handleStreamRequest(url, request) {
   const intro = findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
   const outro = findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
   
-  // Step 3: Fetch playlist text from CDN and rewrite
-  const manifestRes = await fetch(m3u8Url, {
+  // Step 3: Fetch master playlist text from CDN
+  const masterRes = await fetch(m3u8Url, {
     headers: {
       'Referer': 'https://megaplay.buzz/',
       'Origin': 'https://megaplay.buzz',
@@ -655,10 +720,10 @@ async function handleStreamRequest(url, request) {
     }
   });
   
-  if (!manifestRes.ok) {
+  if (!masterRes.ok) {
     return new Response(JSON.stringify({
-      error: 'Failed to download stream configuration playlist from CDN',
-      debug: { m3u8_url: m3u8Url, http_code: manifestRes.status }
+      error: 'Failed to download master stream configuration playlist from CDN',
+      debug: { m3u8_url: m3u8Url, http_code: masterRes.status }
     }), {
       status: 502,
       headers: {
@@ -668,16 +733,89 @@ async function handleStreamRequest(url, request) {
     });
   }
   
-  const manifestText = await manifestRes.text();
-  const rewrittenManifest = rewriteM3u8Manifest(manifestText, m3u8Url, url.origin);
+  const masterText = await masterRes.text();
   
+  // Step 4: Parse master playlist and find highest quality variant URL
+  const variantUrl = parseMasterM3u8(masterText, m3u8Url);
+  if (!variantUrl) {
+    return new Response(JSON.stringify({
+      error: 'Failed to extract quality variant from master playlist',
+      debug: { masterText }
+    }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+  
+  // Step 5: Fetch highest quality variant playlist text directly
+  const variantRes = await fetch(variantUrl, {
+    headers: {
+      'Referer': 'https://megaplay.buzz/',
+      'Origin': 'https://megaplay.buzz',
+      'User-Agent': userAgent
+    }
+  });
+  
+  if (!variantRes.ok) {
+    return new Response(JSON.stringify({
+      error: 'Failed to download variant playlist from CDN',
+      debug: { variantUrl, http_code: variantRes.status }
+    }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+  
+  const variantText = await variantRes.text();
+  
+  // Step 6: Rewrite the variant playlist relative/absolute URLs to use our proxy
+  const rewrittenManifest = rewriteM3u8Manifest(variantText, variantUrl, url.origin);
+  
+  // Step 7: Server-side fetch and resolve all subtitle caption file contents
+  const subtitleTracks = [];
+  for (const track of subtitles) {
+    if (track.file) {
+      try {
+        const vttRes = await fetch(track.file, {
+          headers: {
+            'Referer': 'https://megaplay.buzz/',
+            'Origin': 'https://megaplay.buzz',
+            'User-Agent': userAgent
+          }
+        });
+        if (vttRes.ok) {
+          const vttText = await vttRes.text();
+          subtitleTracks.push({
+            file: track.file,
+            label: track.label,
+            kind: track.kind,
+            content: vttText
+          });
+        } else {
+          subtitleTracks.push(track);
+        }
+      } catch (err) {
+        console.error(`Failed to download subtitle content for ${track.label}:`, err);
+        subtitleTracks.push(track);
+      }
+    } else {
+      subtitleTracks.push(track);
+    }
+  }
+  
+  // Step 8: Return a single fully self-contained response
   return new Response(JSON.stringify({
     success: true,
     manifest: rewrittenManifest,
-    subtitles: subtitles,
+    subtitles: subtitleTracks,
     intro: intro,
-    outro: outro,
-    original_m3u8: m3u8Url
+    outro: outro
   }), {
     headers: {
       "Content-Type": "application/json",
