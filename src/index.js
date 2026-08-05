@@ -33,7 +33,14 @@ async function handleRequest(event) {
     return await handleScheduleRequest(url);
   }
 
-  // 3. ROUTING PIPELINE: Streaming Resolution (megaplay.buzz)
+  // 3. ROUTING PIPELINE: Franchise Tree Proxy (/api/franchise or action=franchise)
+  if (url.pathname === "/api/franchise" || action === "franchise") {
+    const slug = url.searchParams.get("slug");
+    const id = url.searchParams.get("id") || url.searchParams.get("anilistId");
+    return await handleFranchiseRequest(slug, id, userAgent);
+  }
+
+  // 4. ROUTING PIPELINE: Streaming Resolution (megaplay.buzz)
   const anilistId = url.searchParams.get("anilist_id") || url.searchParams.get("id");
   const epNum = url.searchParams.get("ep_num") || url.searchParams.get("ep");
   if (anilistId && epNum) {
@@ -852,4 +859,145 @@ async function handleStreamRequest(url, request) {
       "Access-Control-Allow-Origin": "*"
     }
   });
+}
+
+// -------------------------------------------------------------------------
+// FRANCHISE TREE FETCH & SVELTEKIT JSON DE-SERIALIZATION ENGINE
+// -------------------------------------------------------------------------
+async function handleFranchiseRequest(slug, id, userAgent) {
+  if (!slug || !id) {
+    return new Response(JSON.stringify({ error: "Missing slug or id parameter", seasons: [] }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+  }
+
+  const targetUrl = `https://animex.one/anime/${encodeURIComponent(slug)}-${id}/__data.json?x-sveltekit-invalidated=01`;
+  try {
+    const upstreamRes = await fetch(targetUrl, {
+      headers: {
+        'Referer': 'https://animex.one/',
+        'User-Agent': userAgent,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!upstreamRes.ok) {
+      return new Response(JSON.stringify({ seasons: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    const json = await upstreamRes.json();
+    const seasons = parseAnimexDataPayload(json);
+
+    return new Response(JSON.stringify({ seasons }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600"
+      }
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ seasons: [], error: err.message }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+  }
+}
+
+function parseAnimexDataPayload(json) {
+  if (!json) return [];
+  if (Array.isArray(json.seasons)) return formatSeasonsArray(json.seasons);
+
+  let rawSeasons = null;
+
+  if (json.nodes && Array.isArray(json.nodes)) {
+    for (const node of json.nodes) {
+      if (!node) continue;
+      if (Array.isArray(node.data)) {
+        const flatData = node.data;
+        for (let i = 0; i < flatData.length; i++) {
+          const item = flatData[i];
+          if (item && typeof item === 'object' && !Array.isArray(item)) {
+            if (item.seasons !== undefined) {
+              const deserialized = deserializeSvelteKit(flatData, i);
+              if (deserialized && Array.isArray(deserialized.seasons)) {
+                rawSeasons = deserialized.seasons;
+                break;
+              }
+            }
+          }
+        }
+      } else if (node.data && Array.isArray(node.data.seasons)) {
+        rawSeasons = node.data.seasons;
+      }
+      if (rawSeasons) break;
+    }
+  }
+
+  if (!rawSeasons && json.data && Array.isArray(json.data.seasons)) {
+    rawSeasons = json.data.seasons;
+  }
+
+  if (Array.isArray(rawSeasons)) {
+    return formatSeasonsArray(rawSeasons);
+  }
+
+  return [];
+}
+
+function deserializeSvelteKit(flatData, idx) {
+  if (idx === null || idx === undefined) return null;
+  if (typeof idx !== 'number') return idx;
+  if (idx < 0 || idx >= flatData.length) return idx;
+
+  const val = flatData[idx];
+  if (val === null || val === undefined) return null;
+  if (typeof val !== 'object') return val;
+
+  if (Array.isArray(val)) {
+    return val.map(item => deserializeSvelteKit(flatData, item));
+  }
+
+  const res = {};
+  for (const [k, v] of Object.entries(val)) {
+    res[k] = deserializeSvelteKit(flatData, v);
+  }
+  return res;
+}
+
+function formatSeasonsArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(item => {
+    if (!item) return null;
+    let anilistId = item.anilistId || item.id || item.anilist_id || item.mediaId || '';
+    if (typeof anilistId !== 'string') anilistId = String(anilistId);
+
+    let title = '';
+    if (typeof item.title === 'string') {
+      title = item.title;
+    } else if (item.title && typeof item.title === 'object') {
+      title = item.title.english || item.title.romaji || item.title.userPreferred || '';
+    } else if (item.name) {
+      title = String(item.name);
+    }
+
+    let image = item.image || item.poster || item.coverImage || item.banner || item.cover || '';
+    if (typeof image === 'object' && image !== null) {
+      image = image.large || image.extraLarge || image.medium || '';
+    }
+
+    let type = item.type || item.format || item.mediaType || 'TV';
+    if (typeof type !== 'string') type = 'TV';
+
+    return {
+      anilistId: anilistId,
+      title: title || 'Anime',
+      image: image || '',
+      type: type || 'TV'
+    };
+  }).filter(Boolean);
 }
