@@ -121,7 +121,9 @@ async function handleRequest(event) {
   const headers = new Headers();
   headers.set("User-Agent", userAgent);
 
-  if (srcUrl.includes("megaplay.buzz")) {
+  const isCdnTarget = srcUrl.includes("mewstream.buzz") || srcUrl.toLowerCase().includes(".m3u8") || srcUrl.toLowerCase().includes(".ts");
+
+  if (srcUrl.includes("megaplay.buzz") || isCdnTarget) {
     headers.set("Referer", "https://megaplay.buzz/");
     headers.set("Origin", "https://megaplay.buzz");
   } else if (srcUrl.includes("anikototv.to")) {
@@ -310,7 +312,7 @@ function findSkipTimesRecursive(arr, key) {
 function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
   const parsedUrl = new URL(manifestUrl);
   const scheme = parsedUrl.protocol;
-  const host = 'cdn.mewstream.buzz'; // enforce target source CDN domain
+  const host = parsedUrl.host; // Use the dynamic host of the original manifest URL to prevent path/domain mismatch
   
   let path = parsedUrl.pathname;
   let baseDir = path.substring(0, path.lastIndexOf('/'));
@@ -338,8 +340,6 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
         } else {
           absoluteUrl = baseUrl + trimmed;
         }
-      } else {
-        absoluteUrl = trimmed.replace(/^https?:\/\/[^\/]+/i, `${scheme}//${host}`);
       }
       return getProxyUrl(absoluteUrl);
     } else {
@@ -353,11 +353,10 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
           } else {
             absoluteUri = baseUrl + uri;
           }
-        } else {
-          absoluteUri = uri.replace(/^https?:\/\/[^\/]+/i, `${scheme}//${host}`);
         }
         const newUri = getProxyUrl(absoluteUri);
-        return trimmed.replace(uri, newUri);
+        // Replace ONLY within the URI="..." attribute block to prevent mangling directives like #EXT-X-KEY
+        return trimmed.replace(`URI="${uri}"`, `URI="${newUri}"`).replace(`URI='${uri}'`, `URI='${newUri}'`);
       }
       return line;
     }
@@ -651,6 +650,7 @@ async function handleStreamRequest(url, request) {
   const manifestRes = await fetch(m3u8Url, {
     headers: {
       'Referer': 'https://megaplay.buzz/',
+      'Origin': 'https://megaplay.buzz',
       'User-Agent': userAgent
     }
   });
