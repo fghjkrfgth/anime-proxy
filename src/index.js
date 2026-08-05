@@ -121,9 +121,16 @@ async function handleRequest(event) {
   const headers = new Headers();
   headers.set("User-Agent", userAgent);
 
-  const isCdnTarget = srcUrl.includes("mewstream.buzz") || srcUrl.toLowerCase().includes(".m3u8") || srcUrl.toLowerCase().includes(".ts");
+  const isCdnTarget = 
+    srcUrl.includes("sugevideo.xyz") ||
+    srcUrl.includes("mewstream.buzz") ||
+    srcUrl.includes("megaplay.buzz") ||
+    srcUrl.toLowerCase().includes(".m3u8") || 
+    srcUrl.toLowerCase().includes(".ts") || 
+    srcUrl.toLowerCase().includes(".jpg") || 
+    srcUrl.toLowerCase().includes(".png");
 
-  if (srcUrl.includes("megaplay.buzz") || isCdnTarget) {
+  if (isCdnTarget) {
     headers.set("Referer", "https://megaplay.buzz/");
     headers.set("Origin", "https://megaplay.buzz");
   } else if (srcUrl.includes("anikototv.to")) {
