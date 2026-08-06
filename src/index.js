@@ -140,7 +140,8 @@ async function handleRequest(event) {
     lowerSrcUrl.includes(".jpeg") ||
     lowerSrcUrl.includes(".png") ||
     lowerSrcUrl.includes(".m4s") ||
-    lowerSrcUrl.includes(".mp4");
+    lowerSrcUrl.includes(".mp4") ||
+    lowerSrcUrl.includes(".key");
 
   if (isCdnTarget) {
     headers.set("Referer", "https://megaplay.buzz/");
