@@ -254,9 +254,45 @@ async function handleRequest(event) {
   }
 }
 
-// -------------------------------------------------------------------------
-// HELPER FUNCTIONS & DEEP PARSING PIPELINES
-// -------------------------------------------------------------------------
+// Helper: Rewrite M3U8 manifest segments and URI attributes to proxy URLs
+function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
+  if (!playlistText) return '';
+  let baseUrl;
+  try {
+    baseUrl = new URL(targetUrl);
+  } catch (e) {
+    return playlistText;
+  }
+
+  const lines = playlistText.split(/\r?\n/);
+  const rewrittenLines = lines.map(line => {
+    let trimmed = line.trim();
+    if (!trimmed) return line;
+
+    if (trimmed.startsWith('#')) {
+      return line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
+        let absUrl;
+        try {
+          absUrl = new URL(uri, baseUrl.href).href;
+        } catch (e) {
+          absUrl = uri;
+        }
+        const proxiedUrl = `${workerOrigin}/?src=${encodeURIComponent(absUrl)}`;
+        return `URI="${proxiedUrl}"`;
+      });
+    }
+
+    let absSegmentUrl;
+    try {
+      absSegmentUrl = new URL(trimmed, baseUrl.href).href;
+    } catch (e) {
+      absSegmentUrl = trimmed;
+    }
+    return `${workerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`;
+  });
+
+  return rewrittenLines.join('\n');
+}
 
 // Helper: HTML entity decoder
 function htmlEntityDecode(str) {
