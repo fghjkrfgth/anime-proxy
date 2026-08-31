@@ -987,7 +987,7 @@ function formatSeasonsArray(arr) {
       type: type || 'TV'
     };
   }).filter(Boolean);
-}
+
 
 // -------------------------------------------------------------------------
 // ES MODULE WORKER EXPORT
