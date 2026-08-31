@@ -387,6 +387,7 @@ function findSkipTimesRecursive(arr, key) {
     }
   }
   return null;
+}
 
 // -------------------------------------------------------------------------
 // RESOLVER 1: WEEKLY BROADCAST SCHEDULE ROUTER
@@ -987,3 +988,13 @@ function formatSeasonsArray(arr) {
     };
   }).filter(Boolean);
 }
+
+// -------------------------------------------------------------------------
+// ES MODULE WORKER EXPORT
+// -------------------------------------------------------------------------
+export default {
+  async fetch(request, env, ctx) {
+    return handleRequest({ request });
+  }
+};
+
