@@ -387,61 +387,6 @@ function findSkipTimesRecursive(arr, key) {
     }
   }
   return null;
-}
-
-// Helper: Manifest URL rewriter (Absolute CDN & Tag attribute rewriting)
-function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
-  const parsedUrl = new URL(manifestUrl);
-  const scheme = parsedUrl.protocol;
-  const host = parsedUrl.host;
-
-  let path = parsedUrl.pathname;
-  let baseDir = path.substring(0, path.lastIndexOf('/'));
-  if (baseDir === '' || baseDir === '/') {
-    baseDir = '';
-  }
-
-  const baseUrl = `${scheme}//${host}${baseDir}/`;
-  const originUrl = `${scheme}//${host}`;
-
-  const lines = manifestText.split("\n");
-  const rewrittenLines = lines.map(line => {
-    let trimmed = line.trim();
-    if (trimmed.length === 0) return line;
-
-    const getProxyUrl = (targetUrl) => {
-      return `${workerOrigin}/?src=${encodeURIComponent(targetUrl)}`;
-    };
-
-    const toAbsoluteUrl = (relOrAbsUrl) => {
-      if (relOrAbsUrl.startsWith('http://') || relOrAbsUrl.startsWith('https://')) {
-        return relOrAbsUrl;
-      }
-      if (relOrAbsUrl.startsWith('/')) {
-        return originUrl + relOrAbsUrl;
-      }
-      return baseUrl + relOrAbsUrl;
-    };
-
-    if (!trimmed.startsWith('#')) {
-      const absoluteUrl = toAbsoluteUrl(trimmed);
-      return getProxyUrl(absoluteUrl);
-    } else {
-      // Handles #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.
-      let updatedLine = trimmed;
-      const uriMatches = trimmed.matchAll(/URI=["']([^"']+)["']/g);
-      for (const match of uriMatches) {
-        const rawUri = match[1];
-        const absoluteUri = toAbsoluteUrl(rawUri);
-        const newProxyUri = getProxyUrl(absoluteUri);
-        updatedLine = updatedLine.replace(`URI="${rawUri}"`, `URI="${newProxyUri}"`).replace(`URI='${rawUri}'`, `URI='${newProxyUri}'`);
-      }
-      return updatedLine;
-    }
-  });
-
-  return rewrittenLines.join("\n");
-}
 
 // -------------------------------------------------------------------------
 // RESOLVER 1: WEEKLY BROADCAST SCHEDULE ROUTER
