@@ -9,7 +9,7 @@ addEventListener("fetch", (event) => {
 async function handleRequest(event) {
   const request = event.request;
   const url = new URL(request.url);
-  
+
   // 1. UNIVERSAL OPTIONS PREFLIGHT HANDLER
   if (request.method === "OPTIONS") {
     return new Response(null, {
@@ -105,7 +105,7 @@ async function handleRequest(event) {
   const cache = typeof caches !== 'undefined' ? caches.default : null;
   const cacheKey = request.clone();
   let cachedResponse = null;
-  
+
   if (cache) {
     try {
       cachedResponse = await cache.match(cacheKey);
@@ -128,19 +128,24 @@ async function handleRequest(event) {
   const headers = new Headers();
 
   const lowerSrcUrl = srcUrl.toLowerCase();
-  const isCdnTarget = 
+  const isCdnTarget =
     srcUrl.includes("cloudbuzz.lol") ||
     srcUrl.includes("sugevideo.xyz") ||
     srcUrl.includes("mewstream.buzz") ||
     srcUrl.includes("megaplay.buzz") ||
-    lowerSrcUrl.includes(".html") || 
-    lowerSrcUrl.includes(".m3u8") || 
-    lowerSrcUrl.includes(".ts") || 
-    lowerSrcUrl.includes(".jpg") || 
+    lowerSrcUrl.includes(".html") ||
+    lowerSrcUrl.includes(".m3u8") ||
+    lowerSrcUrl.includes(".ts") ||
+    lowerSrcUrl.includes(".jpg") ||
     lowerSrcUrl.includes(".jpeg") ||
     lowerSrcUrl.includes(".png") ||
     lowerSrcUrl.includes(".m4s") ||
     lowerSrcUrl.includes(".mp4") ||
+    lowerSrcUrl.includes(".ts") ||
+    lowerSrcUrl.includes(".mp3") ||
+    lowerSrcUrl.includes(".js") ||
+    lowerSrcUrl.includes(".json") ||
+    lowerSrcUrl.includes(".xml") ||
     lowerSrcUrl.includes(".key");
 
   if (isCdnTarget) {
@@ -172,7 +177,7 @@ async function handleRequest(event) {
 
   const accept = request.headers.get("Accept");
   if (accept) headers.set("Accept", accept);
-  
+
   const acceptLanguage = request.headers.get("Accept-Language");
   if (acceptLanguage) headers.set("Accept-Language", acceptLanguage);
 
@@ -192,19 +197,19 @@ async function handleRequest(event) {
 
   try {
     const upstreamResponse = await fetch(srcUrl, fetchOptions);
-    
+
     // Check if target is a sub-playlist that requires on-the-fly absolute URI rewriting
     if (srcUrl.toLowerCase().includes(".m3u8") && upstreamResponse.status === 200 && request.method === "GET") {
       const playlistText = await upstreamResponse.text();
       const rewritten = rewriteM3u8Manifest(playlistText, srcUrl, url.origin);
-      
+
       const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", "application/x-mpegURL");
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
       responseHeaders.set("Access-Control-Allow-Headers", "*");
       responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-      
+
       const modifiedResponse = new Response(rewritten, {
         status: 200,
         headers: responseHeaders,
@@ -227,7 +232,7 @@ async function handleRequest(event) {
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     responseHeaders.set("Access-Control-Allow-Headers", "*");
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-    
+
     const modifiedResponse = new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
@@ -389,21 +394,21 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
   const parsedUrl = new URL(manifestUrl);
   const scheme = parsedUrl.protocol;
   const host = parsedUrl.host;
-  
+
   let path = parsedUrl.pathname;
   let baseDir = path.substring(0, path.lastIndexOf('/'));
   if (baseDir === '' || baseDir === '/') {
     baseDir = '';
   }
-  
+
   const baseUrl = `${scheme}//${host}${baseDir}/`;
   const originUrl = `${scheme}//${host}`;
-  
+
   const lines = manifestText.split("\n");
   const rewrittenLines = lines.map(line => {
     let trimmed = line.trim();
     if (trimmed.length === 0) return line;
-    
+
     const getProxyUrl = (targetUrl) => {
       return `${workerOrigin}/?src=${encodeURIComponent(targetUrl)}`;
     };
@@ -417,7 +422,7 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
       }
       return baseUrl + relOrAbsUrl;
     };
-    
+
     if (!trimmed.startsWith('#')) {
       const absoluteUrl = toAbsoluteUrl(trimmed);
       return getProxyUrl(absoluteUrl);
@@ -434,7 +439,7 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
       return updatedLine;
     }
   });
-  
+
   return rewrittenLines.join("\n");
 }
 
@@ -444,46 +449,46 @@ function rewriteM3u8Manifest(manifestText, manifestUrl, workerOrigin) {
 async function handleScheduleRequest(url) {
   const inputTime = parseInt(url.searchParams.get("time") || Math.floor(Date.now() / 1000).toString(), 10);
   const inputTz = parseInt(url.searchParams.get("tz") || "0", 10);
-  
+
   const localizedTime = inputTime + (inputTz * 3600);
   const localizedDate = new Date(localizedTime * 1000);
   const year = localizedDate.getUTCFullYear();
   const month = localizedDate.getUTCMonth();
   const date = localizedDate.getUTCDate();
   const todayMidnightUtc = Math.floor(Date.UTC(year, month, date) / 1000);
-  
+
   const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const payload = [];
-  
+
   for (let i = 0; i < 7; i++) {
     const timestamp = todayMidnightUtc + (i * 86400);
     const dayIndex = new Date(timestamp * 1000).getUTCDay();
     const dayName = daysOfWeek[dayIndex];
-    
+
     const ajaxUrl = `https://anikototv.to/ajax/schedule/date?tz=0&time=${timestamp}`;
     const headers = new Headers({
       'X-Requested-With': 'XMLHttpRequest',
       'Referer': 'https://anikototv.to/home',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     });
-    
+
     const shows = [];
-    
+
     try {
       const res = await fetch(ajaxUrl, { headers });
       if (res.ok) {
         const data = await res.json();
         const html = data.result || '';
-        
+
         const itemRegex = /<a\s+([^>]*class=["'][^"']*item[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
         let match;
         while ((match = itemRegex.exec(html)) !== null) {
           const attrs = match[1];
           const inner = match[2];
-          
+
           const hrefMatch = attrs.match(/href=["']([^"']*)["']/i);
           const href = hrefMatch ? hrefMatch[1] : '';
-          
+
           let slug = '';
           const slugMatch = href.match(/\/watch\/([^\/]+)/i);
           if (slugMatch) {
@@ -491,10 +496,10 @@ async function handleScheduleRequest(url) {
           } else {
             slug = href.substring(href.lastIndexOf('/') + 1);
           }
-          
+
           const timeMatch = inner.match(/<div[^>]+class=["']time["'][^>]*>([\s\S]*?)<\/div>/i);
           const timeStr = timeMatch ? timeMatch[1].replace(/<[^>]*>/g, '').trim() : '';
-          
+
           let showTimeUnix = timestamp;
           if (timeStr) {
             const ampmMatch = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
@@ -515,30 +520,30 @@ async function handleScheduleRequest(url) {
               showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
             }
           }
-          
+
           const epMatch = inner.match(/<div[^>]+class=["']ep["'][^>]*>[\s\S]*?<span>([\s\S]*?)<\/span>/i);
           const epStr = epMatch ? epMatch[1].replace(/<[^>]*>/g, '').trim() : '';
           const epNumClean = epStr.replace(/^Episode\s+/i, '');
-          
+
           let titleEn = '';
           let titleJp = '';
           const titleMatch = inner.match(/<div[^>]+class=["'][^"']*(title\s+d-title|d-title\s+title)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
           if (titleMatch) {
             const titleDivTag = titleMatch[0];
             titleEn = htmlEntityDecode(titleMatch[2].replace(/<[^>]*>/g, '').trim());
-            
+
             const jpMatch = titleDivTag.match(/data-jp=["']([^"']*)["']/i);
             if (jpMatch) {
               titleJp = htmlEntityDecode(jpMatch[1].trim());
             }
           }
-          
+
           let image = '';
           const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
           if (imgMatch) {
             image = imgMatch[1].trim();
           }
-          
+
           const formatTime = (unixSecs) => {
             const date = new Date(unixSecs * 1000);
             let hours = date.getUTCHours();
@@ -550,7 +555,7 @@ async function handleScheduleRequest(url) {
             const hoursStr = hours < 10 ? '0' + hours : hours;
             return `${hoursStr}:${minutesStr} ${ampm}`;
           };
-          
+
           shows.push({
             time: formatTime(showTimeUnix),
             timestamp: showTimeUnix,
@@ -566,14 +571,14 @@ async function handleScheduleRequest(url) {
     } catch (e) {
       console.error(`[Worker Schedule] Failed parsing date ${dayName}:`, e);
     }
-    
+
     payload.push({
       day: dayName,
       timestamp: timestamp,
       shows: shows
     });
   }
-  
+
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const currentDayName = days[new Date(localizedTime * 1000).getUTCDay()];
   let foundIdx = -1;
@@ -583,7 +588,7 @@ async function handleScheduleRequest(url) {
       break;
     }
   }
-  
+
   let reorderedPayload = payload;
   if (foundIdx !== -1) {
     reorderedPayload = [
@@ -591,7 +596,7 @@ async function handleScheduleRequest(url) {
       ...payload.slice(0, foundIdx)
     ];
   }
-  
+
   return new Response(JSON.stringify(reorderedPayload), {
     headers: {
       "Content-Type": "application/json",
@@ -608,13 +613,13 @@ function parseMasterM3u8(masterText, masterUrl) {
   const lines = masterText.split('\n');
   let bestBandwidth = -1;
   let bestUrl = null;
-  
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
       const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
       const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-      
+
       let nextUrl = null;
       for (let j = i + 1; j < lines.length; j++) {
         const subLine = lines[j].trim();
@@ -631,7 +636,7 @@ function parseMasterM3u8(masterText, masterUrl) {
       }
     }
   }
-  
+
   if (!bestUrl) {
     for (const line of lines) {
       const trimmed = line.trim();
@@ -641,9 +646,9 @@ function parseMasterM3u8(masterText, masterUrl) {
       }
     }
   }
-  
+
   if (!bestUrl) return null;
-  
+
   const parsedUrl = new URL(masterUrl);
   const scheme = parsedUrl.protocol;
   const host = parsedUrl.host;
@@ -654,7 +659,7 @@ function parseMasterM3u8(masterText, masterUrl) {
   }
   const baseUrl = `${scheme}//${host}${baseDir}/`;
   const originUrl = `${scheme}//${host}`;
-  
+
   if (!bestUrl.startsWith('http://') && !bestUrl.startsWith('https://')) {
     if (bestUrl.startsWith('/')) {
       return originUrl + bestUrl;
@@ -672,10 +677,10 @@ async function handleStreamRequest(url, request) {
   const anilistId = url.searchParams.get("id") || url.searchParams.get("anilist_id") || url.searchParams.get("anilistId");
   const epNum = url.searchParams.get("e") || url.searchParams.get("ep_num") || url.searchParams.get("ep") || url.searchParams.get("episodeId") || "1";
   const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
-  
+
   const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-  
+
   // Step 1: Fetch target HTML page
   const step1Res = await fetch(megaplayUrl, {
     headers: {
@@ -684,7 +689,7 @@ async function handleStreamRequest(url, request) {
       'Origin': 'https://megaplay.buzz'
     }
   });
-  
+
   if (!step1Res.ok) {
     return new Response(JSON.stringify({
       error: 'Failed to connect to streaming gateway page',
@@ -697,14 +702,14 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   const html = await step1Res.text();
   let fileId = null;
-  
+
   const titleMatch = html.match(/<title>[^<]*?File\s+(\d+)\s*-[^<]*?<\/title>/i);
   const megaMatch = html.match(/File\s+(\d+)\s*-\s*MegaPlay/i);
   const fileMatch = html.match(/File\s+(\d+)/i);
-  
+
   if (titleMatch) {
     fileId = titleMatch[1];
   } else if (megaMatch) {
@@ -712,7 +717,7 @@ async function handleStreamRequest(url, request) {
   } else if (fileMatch) {
     fileId = fileMatch[1];
   }
-  
+
   if (!fileId) {
     return new Response(JSON.stringify({
       error: 'Streaming source token could not be resolved from gateway HTML',
@@ -725,7 +730,7 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   // Step 2: Fetch sources from internal API
   const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
   const step2Res = await fetch(apiUrl, {
@@ -737,7 +742,7 @@ async function handleStreamRequest(url, request) {
       'Origin': 'https://megaplay.buzz'
     }
   });
-  
+
   if (!step2Res.ok) {
     return new Response(JSON.stringify({
       error: 'Failed to resolve streaming paths from internal API gateway',
@@ -750,7 +755,7 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   let sources;
   try {
     sources = await step2Res.json();
@@ -765,7 +770,7 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   const m3u8Url = findM3u8Url(sources);
   if (!m3u8Url) {
     return new Response(JSON.stringify({
@@ -779,11 +784,11 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   const subtitles = findSubtitlesRecursive(sources);
   const intro = findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
   const outro = findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
-  
+
   // Step 3: Fetch master playlist text from CDN
   const masterRes = await fetch(m3u8Url, {
     headers: {
@@ -792,7 +797,7 @@ async function handleStreamRequest(url, request) {
       'User-Agent': userAgent
     }
   });
-  
+
   if (!masterRes.ok) {
     return new Response(JSON.stringify({
       error: 'Failed to download master stream configuration playlist from CDN',
@@ -805,9 +810,9 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   const masterText = await masterRes.text();
-  
+
   // Step 4: Parse master playlist and find highest quality variant URL
   const variantUrl = parseMasterM3u8(masterText, m3u8Url);
   if (!variantUrl) {
@@ -822,7 +827,7 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   // Step 5: Fetch highest quality variant playlist text directly
   const variantRes = await fetch(variantUrl, {
     headers: {
@@ -831,7 +836,7 @@ async function handleStreamRequest(url, request) {
       'User-Agent': userAgent
     }
   });
-  
+
   if (!variantRes.ok) {
     return new Response(JSON.stringify({
       error: 'Failed to download variant playlist from CDN',
@@ -844,12 +849,12 @@ async function handleStreamRequest(url, request) {
       }
     });
   }
-  
+
   const variantText = await variantRes.text();
-  
+
   // Step 6: Rewrite the variant playlist relative/absolute URLs to use our proxy
   const rewrittenManifest = rewriteM3u8Manifest(variantText, variantUrl, url.origin);
-  
+
   // Step 7: Server-side fetch and resolve all subtitle caption file contents
   const subtitleTracks = [];
   for (const track of subtitles) {
@@ -881,7 +886,7 @@ async function handleStreamRequest(url, request) {
       subtitleTracks.push(track);
     }
   }
-  
+
   // Step 8: Return a single fully self-contained response
   return new Response(JSON.stringify({
     success: true,
