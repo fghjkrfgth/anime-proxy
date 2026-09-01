@@ -128,40 +128,27 @@ async function handleRequest(event) {
   const headers = new Headers();
 
   const lowerSrcUrl = srcUrl.toLowerCase();
+  // Determine if the target is an upstream media stream or known CDN domain
   const isCdnTarget =
     srcUrl.includes("cloudbuzz.lol") ||
     srcUrl.includes("sugevideo.xyz") ||
     srcUrl.includes("mewstream.buzz") ||
     srcUrl.includes("megaplay.buzz") ||
-    lowerSrcUrl.includes(".html") ||
-    lowerSrcUrl.includes(".m3u8") ||
-    lowerSrcUrl.includes(".ts") ||
-    lowerSrcUrl.includes(".jpg") ||
-    lowerSrcUrl.includes(".jpeg") ||
-    lowerSrcUrl.includes(".png") ||
-    lowerSrcUrl.includes(".m4s") ||
-    lowerSrcUrl.includes(".mp4") ||
-    lowerSrcUrl.includes(".ts") ||
-    lowerSrcUrl.includes(".mp3") ||
-    lowerSrcUrl.includes(".js") ||
-    lowerSrcUrl.includes(".json") ||
-    lowerSrcUrl.includes(".xml") ||
-    lowerSrcUrl.includes(".css") ||
-    lowerSrcUrl.includes(".key");
+    srcUrl.includes("anikototv.to") ||
+    // Catch all media/segment disguises (any standard file or data extension)
+    /\.(m3u8|ts|m4s|mp4|mp3|aac|key|html|json|js|css|xml|txt|bin|dat|wasm|vtt|srt|jpg|jpeg|png|webp|gif|svg|ico|bmp|woff|woff2|ttf|eot)(\?|$)/i.test(srcUrl) ||
+    // Catch path-based segment routing (/segment/, /hls/, /chunks/, /video/, /stream/, /ep/)
+    /\/(segment|hls|chunks|video|stream|ep|sub|asset|data)\//i.test(lowerSrcUrl);
 
-  if (isCdnTarget) {
+  if (isCdnTarget || !srcUrl.includes(url.hostname)) {
+    // Apply required streaming headers to bypass upstream CDN blocking
     headers.set("Referer", "https://megaplay.buzz/");
     headers.set("Origin", "https://megaplay.buzz");
-    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
+    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
     headers.set("Accept", "*/*");
-    headers.set("Accept-Language", "en-US,en;q=0.9");
     headers.set("Sec-Fetch-Dest", "empty");
     headers.set("Sec-Fetch-Mode", "cors");
     headers.set("Sec-Fetch-Site", "cross-site");
-  } else if (srcUrl.includes("anikototv.to")) {
-    headers.set("Referer", "https://anikototv.to/home");
-    headers.set("Origin", "https://anikototv.to");
-    headers.set("User-Agent", userAgent);
   } else {
     headers.set("User-Agent", userAgent);
     const origReferer = request.headers.get("Referer");
