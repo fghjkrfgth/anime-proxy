@@ -1,4 +1,3 @@
-
 // -------------------------------------------------------------------------
 // CLOUDFLARE WORKER ROUTER & PROXY ENGINE
 // -------------------------------------------------------------------------
@@ -47,7 +46,7 @@ async function handleRequest(event) {
     return await handleStreamRequest(url, request);
   }
 
-  // 5. ROUTING PIPELINE: Subtitle VTT Caption Proxy
+  // 4. ROUTING PIPELINE: Subtitle VTT Caption Proxy
   if (action === "proxy_caption") {
     const vttUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src");
     if (!vttUrl) {
@@ -63,7 +62,7 @@ async function handleRequest(event) {
     try {
       const vttRes = await fetch(vttUrl, {
         headers: {
-          'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
+          'Referer': 'https://megaplay.buzz/',
           'User-Agent': userAgent
         }
       });
@@ -90,7 +89,7 @@ async function handleRequest(event) {
     }
   }
 
-  // 6. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
+  // 5. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
   const srcUrl = url.searchParams.get("src");
   if (!srcUrl) {
     return new Response(JSON.stringify({ error: "Missing 'src' target URL or unsupported route." }), {
@@ -142,6 +141,7 @@ async function handleRequest(event) {
     lowerSrcUrl.includes(".png") ||
     lowerSrcUrl.includes(".m4s") ||
     lowerSrcUrl.includes(".mp4") ||
+    lowerSrcUrl.includes(".ts") ||
     lowerSrcUrl.includes(".mp3") ||
     lowerSrcUrl.includes(".js") ||
     lowerSrcUrl.includes(".json") ||
@@ -149,8 +149,8 @@ async function handleRequest(event) {
     lowerSrcUrl.includes(".key");
 
   if (isCdnTarget) {
-    headers.set("Referer", "[https://megaplay.buzz/](https://megaplay.buzz/)");
-    headers.set("Origin", "[https://megaplay.buzz](https://megaplay.buzz)");
+    headers.set("Referer", "https://megaplay.buzz/");
+    headers.set("Origin", "https://megaplay.buzz");
     headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
     headers.set("Accept", "*/*");
     headers.set("Accept-Language", "en-US,en;q=0.9");
@@ -158,8 +158,8 @@ async function handleRequest(event) {
     headers.set("Sec-Fetch-Mode", "cors");
     headers.set("Sec-Fetch-Site", "cross-site");
   } else if (srcUrl.includes("anikototv.to")) {
-    headers.set("Referer", "[https://anikototv.to/home](https://anikototv.to/home)");
-    headers.set("Origin", "[https://anikototv.to](https://anikototv.to)");
+    headers.set("Referer", "https://anikototv.to/home");
+    headers.set("Origin", "https://anikototv.to");
     headers.set("User-Agent", userAgent);
   } else {
     headers.set("User-Agent", userAgent);
@@ -411,10 +411,10 @@ async function handleScheduleRequest(url) {
     const dayIndex = new Date(timestamp * 1000).getUTCDay();
     const dayName = daysOfWeek[dayIndex];
 
-    const ajaxUrl = `[https://anikototv.to/ajax/schedule/date?tz=0&time=$](https://anikototv.to/ajax/schedule/date?tz=0&time=$){timestamp}`;
+    const ajaxUrl = `https://anikototv.to/ajax/schedule/date?tz=0&time=${timestamp}`;
     const headers = new Headers({
       'X-Requested-With': 'XMLHttpRequest',
-      'Referer': '[https://anikototv.to/home](https://anikototv.to/home)',
+      'Referer': 'https://anikototv.to/home',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     });
 
@@ -554,6 +554,7 @@ async function handleScheduleRequest(url) {
 // -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
 // -------------------------------------------------------------------------
+// Helper: Parse master manifest to find the highest quality stream
 function parseMasterM3u8(masterText, masterUrl) {
   const lines = masterText.split('\n');
   let bestBandwidth = -1;
@@ -616,22 +617,22 @@ function parseMasterM3u8(masterText, masterUrl) {
 }
 
 // -------------------------------------------------------------------------
-// RESOLVER 3: VIDEO STREAM & MANIFEST ROUTER (/rating)
+// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER (/rating)
 // -------------------------------------------------------------------------
 async function handleStreamRequest(url, request) {
   const anilistId = url.searchParams.get("id") || url.searchParams.get("anilist_id") || url.searchParams.get("anilistId");
   const epNum = url.searchParams.get("e") || url.searchParams.get("ep_num") || url.searchParams.get("ep") || url.searchParams.get("episodeId") || "1";
   const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
 
-  const megaplayUrl = `[https://megaplay.buzz/stream/ani/$](https://megaplay.buzz/stream/ani/$){anilistId}/${epNum}/${language}`;
+  const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
   // Step 1: Fetch target HTML page
   const step1Res = await fetch(megaplayUrl, {
     headers: {
-      'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
+      'Referer': 'https://megaplay.buzz/',
       'User-Agent': userAgent,
-      'Origin': '[https://megaplay.buzz](https://megaplay.buzz)'
+      'Origin': 'https://megaplay.buzz'
     }
   });
 
@@ -677,14 +678,14 @@ async function handleStreamRequest(url, request) {
   }
 
   // Step 2: Fetch sources from internal API
-  const apiUrl = `[https://megaplay.buzz/stream/getSources?id=$](https://megaplay.buzz/stream/getSources?id=$){fileId}`;
+  const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
   const step2Res = await fetch(apiUrl, {
     headers: {
       'X-Requested-With': 'XMLHttpRequest',
       'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
+      'Referer': 'https://megaplay.buzz/',
       'User-Agent': userAgent,
-      'Origin': '[https://megaplay.buzz](https://megaplay.buzz)'
+      'Origin': 'https://megaplay.buzz'
     }
   });
 
@@ -737,8 +738,8 @@ async function handleStreamRequest(url, request) {
   // Step 3: Fetch master playlist text from CDN
   const masterRes = await fetch(m3u8Url, {
     headers: {
-      'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
-      'Origin': '[https://megaplay.buzz](https://megaplay.buzz)',
+      'Referer': 'https://megaplay.buzz/',
+      'Origin': 'https://megaplay.buzz',
       'User-Agent': userAgent
     }
   });
@@ -776,8 +777,8 @@ async function handleStreamRequest(url, request) {
   // Step 5: Fetch highest quality variant playlist text directly
   const variantRes = await fetch(variantUrl, {
     headers: {
-      'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
-      'Origin': '[https://megaplay.buzz](https://megaplay.buzz)',
+      'Referer': 'https://megaplay.buzz/',
+      'Origin': 'https://megaplay.buzz',
       'User-Agent': userAgent
     }
   });
@@ -807,8 +808,8 @@ async function handleStreamRequest(url, request) {
       try {
         const vttRes = await fetch(track.file, {
           headers: {
-            'Referer': '[https://megaplay.buzz/](https://megaplay.buzz/)',
-            'Origin': '[https://megaplay.buzz](https://megaplay.buzz)',
+            'Referer': 'https://megaplay.buzz/',
+            'Origin': 'https://megaplay.buzz',
             'User-Agent': userAgent
           }
         });
@@ -858,11 +859,11 @@ async function handleFranchiseRequest(slug, id, userAgent) {
     });
   }
 
-  const targetUrl = `[https://animex.one/anime/$](https://animex.one/anime/$){encodeURIComponent(slug)}-${id}/__data.json?x-sveltekit-invalidated=01`;
+  const targetUrl = `https://animex.one/anime/${encodeURIComponent(slug)}-${id}/__data.json?x-sveltekit-invalidated=01`;
   try {
     const upstreamRes = await fetch(targetUrl, {
       headers: {
-        'Referer': '[https://animex.one/](https://animex.one/)',
+        'Referer': 'https://animex.one/',
         'User-Agent': userAgent,
         'Accept': 'application/json'
       }
@@ -987,7 +988,7 @@ function formatSeasonsArray(arr) {
     };
   }).filter(Boolean);
 }
-                                                                           
+
 // -------------------------------------------------------------------------
 // ES MODULE WORKER EXPORT
 // -------------------------------------------------------------------------
@@ -996,3 +997,4 @@ export default {
     return handleRequest({ request });
   }
 };
+
