@@ -146,6 +146,7 @@ async function handleRequest(event) {
     lowerSrcUrl.includes(".js") ||
     lowerSrcUrl.includes(".json") ||
     lowerSrcUrl.includes(".xml") ||
+    lowerSrcUrl.includes(".css") ||
     lowerSrcUrl.includes(".key");
 
   if (isCdnTarget) {
