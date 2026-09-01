@@ -91,158 +91,75 @@ async function handleRequest(event) {
 
   // 5. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
   const srcUrl = url.searchParams.get("src");
-  if (!srcUrl) {
-    return new Response(JSON.stringify({ error: "Missing 'src' target URL or unsupported route." }), {
-      status: 400,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      },
-    });
+  if (srcUrl) {
+    return await handleTransparentProxy(srcUrl, request, url);
   }
 
-  // Cache read initialization
-  const cache = typeof caches !== 'undefined' ? caches.default : null;
-  const cacheKey = request.clone();
-  let cachedResponse = null;
+  return new Response(JSON.stringify({ error: "Unsupported route or missing parameters" }), {
+    status: 400,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
 
-  if (cache) {
-    try {
-      cachedResponse = await cache.match(cacheKey);
-    } catch (e) {
-      console.warn("[Worker Cache] Match error:", e);
-    }
-  }
-
-  if (cachedResponse) {
-    const headers = new Headers(cachedResponse.headers);
-    headers.set("Access-Control-Allow-Origin", "*");
-    return new Response(cachedResponse.body, {
-      status: cachedResponse.status,
-      statusText: cachedResponse.statusText,
-      headers,
-    });
-  }
-
-  // Construct request headers for upstream target forwarding
+// Universal Transparent Proxy Handler for all ?src= media segments and keys
+async function handleTransparentProxy(srcUrl, request, workerUrl) {
   const headers = new Headers();
 
-  const lowerSrcUrl = srcUrl.toLowerCase();
-  // Determine if the target is an upstream media stream or known CDN domain
-  const isCdnTarget =
-    srcUrl.includes("cloudbuzz.lol") ||
-    srcUrl.includes("sugevideo.xyz") ||
-    srcUrl.includes("mewstream.buzz") ||
-    srcUrl.includes("megaplay.buzz") ||
-    srcUrl.includes("anikototv.to") ||
-    // Catch all media/segment disguises (any standard file or data extension)
-    /\.(m3u8|ts|m4s|mp4|mp3|aac|key|html|json|js|css|xml|txt|bin|dat|wasm|vtt|srt|jpg|jpeg|png|webp|gif|svg|ico|bmp|woff|woff2|ttf|eot)(\?|$)/i.test(srcUrl) ||
-    // Catch path-based segment routing (/segment/, /hls/, /chunks/, /video/, /stream/, /ep/)
-    /\/(segment|hls|chunks|video|stream|ep|sub|asset|data)\//i.test(lowerSrcUrl);
+  // 1. Normalize and attach required anti-leech headers for all third-party media CDNs
+  headers.set("Referer", "https://megaplay.buzz/");
+  headers.set("Origin", "https://megaplay.buzz");
+  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+  headers.set("Accept", "*/*");
+  headers.set("Accept-Language", "en-US,en;q=0.9");
+  headers.set("Sec-Fetch-Dest", "empty");
+  headers.set("Sec-Fetch-Mode", "cors");
+  headers.set("Sec-Fetch-Site", "cross-site");
 
-  if (isCdnTarget || !srcUrl.includes(url.hostname)) {
-    // Apply required streaming headers to bypass upstream CDN blocking
-    headers.set("Referer", "https://megaplay.buzz/");
-    headers.set("Origin", "https://megaplay.buzz");
-    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-    headers.set("Accept", "*/*");
-    headers.set("Sec-Fetch-Dest", "empty");
-    headers.set("Sec-Fetch-Mode", "cors");
-    headers.set("Sec-Fetch-Site", "cross-site");
-  } else {
-    headers.set("User-Agent", userAgent);
-    const origReferer = request.headers.get("Referer");
-    if (origReferer) headers.set("Referer", origReferer);
-    const origOrigin = request.headers.get("Origin");
-    if (origOrigin) headers.set("Origin", origOrigin);
-  }
-
-  // Forward Range header if present for byte-range segment requests
+  // 2. Forward Range header if requested by HLS player
   const rangeHeader = request.headers.get("Range");
   if (rangeHeader) {
     headers.set("Range", rangeHeader);
   }
 
-  const accept = request.headers.get("Accept");
-  if (accept) headers.set("Accept", accept);
-
-  const acceptLanguage = request.headers.get("Accept-Language");
-  if (acceptLanguage) headers.set("Accept-Language", acceptLanguage);
-
-  if (request.method === "POST" || request.method === "PUT") {
-    const contentType = request.headers.get("Content-Type") || "application/json";
-    headers.set("Content-Type", contentType);
-  }
-
-  const fetchOptions = {
-    method: request.method,
-    headers: headers,
-  };
-
-  if (request.method === "POST" || request.method === "PUT") {
-    fetchOptions.body = await request.text();
-  }
-
   try {
-    const upstreamResponse = await fetch(srcUrl, fetchOptions);
+    const upstreamResponse = await fetch(srcUrl, {
+      method: request.method,
+      headers: headers,
+    });
 
-    // Check if target is a sub-playlist that requires on-the-fly absolute URI rewriting
+    // Handle M3U8 Sub-Playlist Rewriting on-the-fly
     if (srcUrl.toLowerCase().includes(".m3u8") && upstreamResponse.status === 200 && request.method === "GET") {
       const playlistText = await upstreamResponse.text();
-      const rewritten = rewriteM3u8Manifest(playlistText, srcUrl, url.origin);
+      const rewritten = rewriteM3u8Manifest(playlistText, srcUrl, workerUrl.origin);
 
-      const responseHeaders = new Headers();
-      responseHeaders.set("Content-Type", "application/x-mpegURL");
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-      responseHeaders.set("Access-Control-Allow-Headers", "*");
-      responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-
-      const modifiedResponse = new Response(rewritten, {
+      return new Response(rewritten, {
         status: 200,
-        headers: responseHeaders,
+        headers: {
+          "Content-Type": "application/x-mpegURL",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+        },
       });
-
-      if (cache) {
-        try {
-          event.waitUntil(cache.put(cacheKey, modifiedResponse.clone()));
-        } catch (e) {
-          console.warn("[Worker Cache] Put error:", e);
-        }
-      }
-
-      return modifiedResponse;
     }
 
-    // Direct proxy response (TS/HTML segments, keys, etc.)
+    // 3. Forward stream response with full CORS and byte-range preservation
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     responseHeaders.set("Access-Control-Allow-Headers", "*");
-    responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+    responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
 
-    const modifiedResponse = new Response(upstreamResponse.body, {
+    return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers: responseHeaders,
     });
-
-    if (cache && upstreamResponse.status === 200 && request.method === "GET") {
-      try {
-        event.waitUntil(cache.put(cacheKey, modifiedResponse.clone()));
-      } catch (e) {
-        console.warn("[Worker Cache] Put error:", e);
-      }
-    }
-
-    return modifiedResponse;
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
+    return new Response(JSON.stringify({ error: err.message, src: srcUrl }), {
       status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      },
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 }
