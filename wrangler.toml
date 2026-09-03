@@ -1,7 +1,8 @@
-# wrangler.toml
-name = 'anime-proxy'
+name = "blackleg-worker"
 main = "src/index.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2024-04-05"
 
-[vars]
-ENVIRONMENT = "production"
+[[d1_databases]]
+binding = "DB"
+database_name = "1"
+database_id = "5a5a6624-6037-484a-8e56-4c83f0465b67"
