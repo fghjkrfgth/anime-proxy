@@ -1,13 +1,104 @@
-// -------------------------------------------------------------------------
-// CLOUDFLARE WORKER ROUTER & PROXY ENGINE
-// -------------------------------------------------------------------------
+const JWT_SECRET = "blackleg-jwt-auth-secret-key-2026";
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status: status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+    }
+  });
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes;
+}
+
+async function getHmacKey(secretStr = JWT_SECRET) {
+  const encoder = new TextEncoder();
+  return await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secretStr),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+async function hashPassword(password, saltHex) {
+  const encoder = new TextEncoder();
+  const passwordKey = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const saltBytes = hexToBytes(saltHex);
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    passwordKey,
+    256
+  );
+  return bytesToHex(new Uint8Array(derivedBits));
+}
+
+async function signToken(payloadObj, secretStr = JWT_SECRET) {
+  const key = await getHmacKey(secretStr);
+  const encoder = new TextEncoder();
+  const jsonStr = JSON.stringify(payloadObj);
+  const payloadBase64 = btoa(jsonStr).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const signatureBits = await crypto.subtle.sign("HMAC", key, encoder.encode(payloadBase64));
+  const sigHex = bytesToHex(new Uint8Array(signatureBits));
+  return `${payloadBase64}.${sigHex}`;
+}
+
+async function verifyToken(tokenStr, secretStr = JWT_SECRET) {
+  if (!tokenStr || typeof tokenStr !== 'string') return null;
+  const parts = tokenStr.split('.');
+  if (parts.length !== 2) return null;
+  const [payloadBase64, sigHex] = parts;
+  try {
+    const key = await getHmacKey(secretStr);
+    const encoder = new TextEncoder();
+    const sigBytes = hexToBytes(sigHex);
+    const isValid = await crypto.subtle.verify("HMAC", key, sigBytes, encoder.encode(payloadBase64));
+    if (!isValid) return null;
+
+    const base64 = payloadBase64.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonStr = atob(base64);
+    const payload = JSON.parse(jsonStr);
+
+    if (payload.exp && Date.now() > payload.exp) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
 
 addEventListener("fetch", (event) => {
   event.respondWith(handleRequest(event));
 });
 
-async function handleRequest(event) {
-  const request = event.request;
+async function handleRequest(eventOrReq, envParam) {
+  const request = eventOrReq.request ? eventOrReq.request : eventOrReq;
+  const env = envParam || globalThis.env || {};
+  const db = env.DB || globalThis.DB;
   const url = new URL(request.url);
 
   // 1. UNIVERSAL OPTIONS PREFLIGHT HANDLER
@@ -22,6 +113,132 @@ async function handleRequest(event) {
         "Access-Control-Max-Age": "86400",
       },
     });
+  }
+
+  // 1.5 D1 AUTH & CLOUD WATCH VAULT SYNC ENDPOINTS
+  if (url.pathname === "/api/auth/register" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const { email, password } = body || {};
+
+      if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return jsonResponse({ error: "Invalid email format" }, 400);
+      }
+      if (!password || typeof password !== 'string' || password.length < 6) {
+        return jsonResponse({ error: "Password must be at least 6 characters" }, 400);
+      }
+      if (!db) {
+        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+      }
+
+      const normalizedEmail = email.trim().toLowerCase();
+      const existing = await db.prepare("SELECT id FROM users WHERE email = ?").bind(normalizedEmail).first();
+      if (existing) {
+        return jsonResponse({ error: "An account with this email already exists" }, 409);
+      }
+
+      const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+      const saltHex = bytesToHex(saltBytes);
+      const passwordHash = await hashPassword(password, saltHex);
+      const userId = crypto.randomUUID();
+      const now = Date.now();
+
+      await db.prepare("INSERT INTO users (id, email, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)").bind(userId, normalizedEmail, passwordHash, saltHex, now).run();
+      await db.prepare("INSERT INTO user_vault (user_id, watch_vault, updated_at) VALUES (?, ?, ?)").bind(userId, JSON.stringify([]), now).run();
+
+      const token = await signToken({ userId, email: normalizedEmail, exp: Date.now() + 30 * 24 * 3600 * 1000 });
+      return jsonResponse({ success: true, token, user: { id: userId, email: normalizedEmail } });
+    } catch (err) {
+      return jsonResponse({ error: err.message || "Registration failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/auth/login" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const { email, password } = body || {};
+
+      if (!email || !password) {
+        return jsonResponse({ error: "Email and password required" }, 400);
+      }
+      if (!db) {
+        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+      }
+
+      const normalizedEmail = email.trim().toLowerCase();
+      const user = await db.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
+      if (!user) {
+        return jsonResponse({ error: "Invalid email or password" }, 401);
+      }
+
+      const computedHash = await hashPassword(password, user.salt);
+      if (computedHash !== user.password_hash) {
+        return jsonResponse({ error: "Invalid email or password" }, 401);
+      }
+
+      const token = await signToken({ userId: user.id, email: user.email, exp: Date.now() + 30 * 24 * 3600 * 1000 });
+      return jsonResponse({ success: true, token, user: { id: user.id, email: user.email } });
+    } catch (err) {
+      return jsonResponse({ error: err.message || "Login failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/user/sync" && request.method === "GET") {
+    try {
+      const authHeader = request.headers.get("Authorization") || "";
+      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+      const session = await verifyToken(token);
+      if (!session) {
+        return jsonResponse({ error: "Unauthorized or expired session token" }, 401);
+      }
+      if (!db) {
+        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+      }
+
+      const record = await db.prepare("SELECT watch_vault, updated_at FROM user_vault WHERE user_id = ?").bind(session.userId).first();
+      let vault = [];
+      if (record && record.watch_vault) {
+        try {
+          vault = JSON.parse(record.watch_vault);
+        } catch (e) {
+          vault = [];
+        }
+      }
+      return jsonResponse({ success: true, vault, updatedAt: record ? record.updated_at : 0 });
+    } catch (err) {
+      return jsonResponse({ error: err.message || "Sync failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/user/sync" && request.method === "POST") {
+    try {
+      const authHeader = request.headers.get("Authorization") || "";
+      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+      const session = await verifyToken(token);
+      if (!session) {
+        return jsonResponse({ error: "Unauthorized or expired session token" }, 401);
+      }
+      if (!db) {
+        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+      }
+
+      const body = await request.json();
+      const vault = body?.vault || [];
+      const vaultStr = JSON.stringify(vault);
+      const now = Date.now();
+
+      await db.prepare(`
+        INSERT INTO user_vault (user_id, watch_vault, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          watch_vault = excluded.watch_vault,
+          updated_at = excluded.updated_at
+      `).bind(session.userId, vaultStr, now).run();
+
+      return jsonResponse({ success: true, updatedAt: now });
+    } catch (err) {
+      return jsonResponse({ error: err.message || "Sync failed" }, 500);
+    }
   }
 
   // Define client User-Agent
@@ -899,7 +1116,7 @@ function formatSeasonsArray(arr) {
 // -------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
-    return handleRequest({ request });
+    return handleRequest(request, env);
   }
 };
 
