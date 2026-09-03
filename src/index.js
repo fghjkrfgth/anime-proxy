@@ -6,7 +6,7 @@ function jsonResponse(data, status = 200) {
     headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
     }
   });
@@ -98,7 +98,7 @@ addEventListener("fetch", (event) => {
 async function handleRequest(eventOrReq, envParam) {
   const request = eventOrReq.request ? eventOrReq.request : eventOrReq;
   const env = envParam || globalThis.env || {};
-  const db = env.DB || globalThis.DB;
+  const db = env?.DB || globalThis.DB;
   const url = new URL(request.url);
 
   // 1. UNIVERSAL OPTIONS PREFLIGHT HANDLER
@@ -107,34 +107,37 @@ async function handleRequest(eventOrReq, envParam) {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
         "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
         "Access-Control-Max-Age": "86400",
       },
     });
   }
 
+  const normPath = url.pathname.replace(/\/+$/, "");
+  const queryAction = url.searchParams.get("action");
+
   // 1.5 D1 AUTH & CLOUD WATCH VAULT SYNC ENDPOINTS
-  if (url.pathname === "/api/auth/register" && request.method === "POST") {
+  if ((normPath === "/api/auth/register" || queryAction === "register") && request.method === "POST") {
     try {
+      if (!db) {
+        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      }
       const body = await request.json();
       const { email, password } = body || {};
 
       if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-        return jsonResponse({ error: "Invalid email format" }, 400);
+        return jsonResponse({ success: false, error: "Invalid email format" }, 400);
       }
       if (!password || typeof password !== 'string' || password.length < 6) {
-        return jsonResponse({ error: "Password must be at least 6 characters" }, 400);
-      }
-      if (!db) {
-        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+        return jsonResponse({ success: false, error: "Password must be at least 6 characters" }, 400);
       }
 
       const normalizedEmail = email.trim().toLowerCase();
       const existing = await db.prepare("SELECT id FROM users WHERE email = ?").bind(normalizedEmail).first();
       if (existing) {
-        return jsonResponse({ error: "An account with this email already exists" }, 409);
+        return jsonResponse({ success: false, error: "An account with this email already exists" }, 409);
       }
 
       const saltBytes = crypto.getRandomValues(new Uint8Array(16));
@@ -149,50 +152,50 @@ async function handleRequest(eventOrReq, envParam) {
       const token = await signToken({ userId, email: normalizedEmail, exp: Date.now() + 30 * 24 * 3600 * 1000 });
       return jsonResponse({ success: true, token, user: { id: userId, email: normalizedEmail } });
     } catch (err) {
-      return jsonResponse({ error: err.message || "Registration failed" }, 500);
+      return jsonResponse({ success: false, error: err.message || "Registration failed" }, 500);
     }
   }
 
-  if (url.pathname === "/api/auth/login" && request.method === "POST") {
+  if ((normPath === "/api/auth/login" || queryAction === "login") && request.method === "POST") {
     try {
+      if (!db) {
+        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      }
       const body = await request.json();
       const { email, password } = body || {};
 
       if (!email || !password) {
-        return jsonResponse({ error: "Email and password required" }, 400);
-      }
-      if (!db) {
-        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+        return jsonResponse({ success: false, error: "Email and password required" }, 400);
       }
 
       const normalizedEmail = email.trim().toLowerCase();
       const user = await db.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
       if (!user) {
-        return jsonResponse({ error: "Invalid email or password" }, 401);
+        return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
       }
 
       const computedHash = await hashPassword(password, user.salt);
       if (computedHash !== user.password_hash) {
-        return jsonResponse({ error: "Invalid email or password" }, 401);
+        return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
       }
 
       const token = await signToken({ userId: user.id, email: user.email, exp: Date.now() + 30 * 24 * 3600 * 1000 });
       return jsonResponse({ success: true, token, user: { id: user.id, email: user.email } });
     } catch (err) {
-      return jsonResponse({ error: err.message || "Login failed" }, 500);
+      return jsonResponse({ success: false, error: err.message || "Login failed" }, 500);
     }
   }
 
-  if (url.pathname === "/api/user/sync" && request.method === "GET") {
+  if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "GET") {
     try {
+      if (!db) {
+        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      }
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
       if (!session) {
-        return jsonResponse({ error: "Unauthorized or expired session token" }, 401);
-      }
-      if (!db) {
-        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+        return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
       }
 
       const record = await db.prepare("SELECT watch_vault, updated_at FROM user_vault WHERE user_id = ?").bind(session.userId).first();
@@ -206,20 +209,20 @@ async function handleRequest(eventOrReq, envParam) {
       }
       return jsonResponse({ success: true, vault, updatedAt: record ? record.updated_at : 0 });
     } catch (err) {
-      return jsonResponse({ error: err.message || "Sync failed" }, 500);
+      return jsonResponse({ success: false, error: err.message || "Sync failed" }, 500);
     }
   }
 
-  if (url.pathname === "/api/user/sync" && request.method === "POST") {
+  if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "POST") {
     try {
+      if (!db) {
+        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      }
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
       if (!session) {
-        return jsonResponse({ error: "Unauthorized or expired session token" }, 401);
-      }
-      if (!db) {
-        return jsonResponse({ error: "D1 Database binding not configured" }, 500);
+        return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
       }
 
       const body = await request.json();
@@ -237,7 +240,7 @@ async function handleRequest(eventOrReq, envParam) {
 
       return jsonResponse({ success: true, updatedAt: now });
     } catch (err) {
-      return jsonResponse({ error: err.message || "Sync failed" }, 500);
+      return jsonResponse({ success: false, error: err.message || "Sync failed" }, 500);
     }
   }
 
