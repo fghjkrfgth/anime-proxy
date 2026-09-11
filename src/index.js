@@ -522,36 +522,43 @@ function htmlEntityDecode(str) {
 function findM3u8Url(data) {
   if (!data || typeof data !== 'object') return null;
 
-  // 1. Direct priority check on known video source structures
+  // 1. Direct check in sources array (standard format: sources: [{ file: '...m3u8' }])
   if (Array.isArray(data.sources)) {
     for (const src of data.sources) {
-      const file = src?.file || src?.url;
-      if (typeof file === 'string' && /\.m3u8(\?|$)/i.test(file) && !file.includes('/subtitles/') && !file.endsWith('.vtt')) {
-        return file;
+      if (src && typeof src.file === 'string' && /\.m3u8(\?|$)/i.test(src.file)) {
+        return src.file;
+      }
+      if (src && typeof src.url === 'string' && /\.m3u8(\?|$)/i.test(src.url)) {
+        return src.url;
       }
     }
   }
 
-  if (typeof data.video === 'string' && /\.m3u8(\?|$)/i.test(data.video)) return data.video;
-  if (typeof data.file === 'string' && /\.m3u8(\?|$)/i.test(data.file) && !data.file.includes('/subtitles/') && !data.file.endsWith('.vtt')) return data.file;
+  // 2. Direct top-level fields
+  if (typeof data.file === 'string' && /\.m3u8(\?|$)/i.test(data.file)) {
+    return data.file;
+  }
+  if (typeof data.video === 'string' && /\.m3u8(\?|$)/i.test(data.video)) {
+    return data.video;
+  }
+  if (typeof data.url === 'string' && /\.m3u8(\?|$)/i.test(data.url)) {
+    return data.url;
+  }
 
-  // 2. Strict recursive search: ONLY match .m3u8 strings, NEVER match .vtt or /subtitles/
+  // 3. Recursive search (strictly skip subtitle and track keys)
   for (const key of Object.keys(data)) {
-    // Skip subtitle blocks completely
-    if (key.toLowerCase().includes('subtitle') || key.toLowerCase().includes('caption') || key.toLowerCase() === 'tracks') {
+    const lowerKey = key.toLowerCase();
+    if (lowerKey === 'tracks' || lowerKey === 'subtitles' || lowerKey === 'captions' || lowerKey === 'intro' || lowerKey === 'outro') {
       continue;
     }
 
     const val = data[key];
-    if (typeof val === 'string') {
-      const isM3u8 = /\.m3u8(\?|$)/i.test(val);
-      const isSubtitle = val.includes('/subtitles/') || val.endsWith('.vtt') || val.endsWith('.srt');
-      if (isM3u8 && !isSubtitle) {
-        return val;
-      }
-    } else if (typeof val === 'object' && val !== null) {
-      const found = findM3u8Url(val);
-      if (found) return found;
+    if (typeof val === 'string' && /\.m3u8(\?|$)/i.test(val)) {
+      return val;
+    }
+    if (typeof val === 'object' && val !== null) {
+      const nested = findM3u8Url(val);
+      if (nested) return nested;
     }
   }
 
