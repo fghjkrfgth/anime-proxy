@@ -244,7 +244,7 @@ async function handleRequest(eventOrReq, envParam) {
     }
   }
 
-  // Define client User-Agent
+  // Client User-Agent
   let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
   // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (/schedule)
@@ -679,14 +679,22 @@ async function handleScheduleRequest(url) {
 // -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
 // -------------------------------------------------------------------------
-// Helper: Parse master manifest to find the highest quality stream
 function parseMasterM3u8(masterText, masterUrl) {
-  const lines = masterText.split('\n');
+  if (!masterText) return masterUrl;
+
+  // If already a media playlist containing media chunks, return master URL directly
+  if (masterText.includes('#EXTINF:')) {
+    return masterUrl;
+  }
+
+  const lines = masterText.split(/\r?\n/);
   let bestBandwidth = -1;
   let bestUrl = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+
+    // Strictly match STREAM-INF tags and ignore media/subtitles
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
       const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
       const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
@@ -699,8 +707,15 @@ function parseMasterM3u8(masterText, masterUrl) {
           break;
         }
       }
+
+      // Filter out subtitle tracks or non-video playlists
       if (nextUrl) {
-        if (bandwidth > bestBandwidth || bestUrl === null) {
+        const isSubTrack = nextUrl.toLowerCase().includes('/subtitles/') ||
+                           nextUrl.toLowerCase().endsWith('.vtt') ||
+                           nextUrl.toLowerCase().endsWith('.srt') ||
+                           nextUrl.toLowerCase().includes('webvtt');
+
+        if (!isSubTrack && (bandwidth > bestBandwidth || bestUrl === null)) {
           bestBandwidth = bandwidth;
           bestUrl = nextUrl;
         }
@@ -708,37 +723,13 @@ function parseMasterM3u8(masterText, masterUrl) {
     }
   }
 
-  if (!bestUrl) {
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('#')) {
-        bestUrl = trimmed;
-        break;
-      }
-    }
-  }
+  if (!bestUrl) return masterUrl;
 
-  if (!bestUrl) return null;
-
-  const parsedUrl = new URL(masterUrl);
-  const scheme = parsedUrl.protocol;
-  const host = parsedUrl.host;
-  let path = parsedUrl.pathname;
-  let baseDir = path.substring(0, path.lastIndexOf('/'));
-  if (baseDir === '' || baseDir === '/') {
-    baseDir = '';
+  try {
+    return new URL(bestUrl, masterUrl).href;
+  } catch (e) {
+    return bestUrl;
   }
-  const baseUrl = `${scheme}//${host}${baseDir}/`;
-  const originUrl = `${scheme}//${host}`;
-
-  if (!bestUrl.startsWith('http://') && !bestUrl.startsWith('https://')) {
-    if (bestUrl.startsWith('/')) {
-      return originUrl + bestUrl;
-    } else {
-      return baseUrl + bestUrl;
-    }
-  }
-  return bestUrl;
 }
 
 // -------------------------------------------------------------------------
@@ -885,46 +876,34 @@ async function handleStreamRequest(url, request) {
   const masterText = await masterRes.text();
 
   // Step 4: Parse master playlist and find highest quality variant URL
-  const variantUrl = parseMasterM3u8(masterText, m3u8Url);
-  if (!variantUrl) {
-    return new Response(JSON.stringify({
-      error: 'Failed to extract quality variant from master playlist',
-      debug: { masterText }
-    }), {
-      status: 502,
+  let variantUrl = parseMasterM3u8(masterText, m3u8Url) || m3u8Url;
+
+  // Step 5: Fetch highest quality variant playlist text, with automatic fallback to master
+  let variantText = '';
+  let finalPlaylistUrl = variantUrl;
+
+  try {
+    const variantRes = await fetch(variantUrl, {
       headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+        'Referer': 'https://megaplay.buzz/',
+        'Origin': 'https://megaplay.buzz',
+        'User-Agent': userAgent
       }
     });
-  }
 
-  // Step 5: Fetch highest quality variant playlist text directly
-  const variantRes = await fetch(variantUrl, {
-    headers: {
-      'Referer': 'https://megaplay.buzz/',
-      'Origin': 'https://megaplay.buzz',
-      'User-Agent': userAgent
+    if (variantRes.ok) {
+      variantText = await variantRes.text();
+    } else {
+      variantText = masterText;
+      finalPlaylistUrl = m3u8Url;
     }
-  });
-
-  if (!variantRes.ok) {
-    return new Response(JSON.stringify({
-      error: 'Failed to download variant playlist from CDN',
-      debug: { variantUrl, http_code: variantRes.status }
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
+  } catch (e) {
+    variantText = masterText;
+    finalPlaylistUrl = m3u8Url;
   }
 
-  const variantText = await variantRes.text();
-
-  // Step 6: Rewrite the variant playlist relative/absolute URLs to use our proxy
-  const rewrittenManifest = rewriteM3u8Manifest(variantText, variantUrl, url.origin);
+  // Step 6: Rewrite the playlist relative/absolute URLs to use our proxy
+  const rewrittenManifest = rewriteM3u8Manifest(variantText, finalPlaylistUrl, url.origin);
 
   // Step 7: Server-side fetch and resolve all subtitle caption file contents
   const subtitleTracks = [];
@@ -1122,4 +1101,3 @@ export default {
     return handleRequest(request, env);
   }
 };
-
