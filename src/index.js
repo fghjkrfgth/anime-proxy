@@ -519,24 +519,42 @@ function htmlEntityDecode(str) {
 }
 
 // Helper: Discover master manifest path (.m3u8)
-function findM3u8Url(arr) {
-  if (!arr || typeof arr !== 'object') return null;
-  if (typeof arr.video === 'string') return arr.video;
-  if (typeof arr.file === 'string') return arr.file;
-  if (Array.isArray(arr.sources)) {
-    for (let src of arr.sources) {
-      if (typeof src.file === 'string') return src.file;
+function findM3u8Url(data) {
+  if (!data || typeof data !== 'object') return null;
+
+  // 1. Direct priority check on known video source structures
+  if (Array.isArray(data.sources)) {
+    for (const src of data.sources) {
+      const file = src?.file || src?.url;
+      if (typeof file === 'string' && /\.m3u8(\?|$)/i.test(file) && !file.includes('/subtitles/') && !file.endsWith('.vtt')) {
+        return file;
+      }
     }
   }
-  for (let k in arr) {
-    let v = arr[k];
-    if (typeof v === 'string' && /\.m3u8(\?|$)/i.test(v)) {
-      return v;
-    } else if (typeof v === 'object' && v !== null) {
-      let res = findM3u8Url(v);
-      if (res) return res;
+
+  if (typeof data.video === 'string' && /\.m3u8(\?|$)/i.test(data.video)) return data.video;
+  if (typeof data.file === 'string' && /\.m3u8(\?|$)/i.test(data.file) && !data.file.includes('/subtitles/') && !data.file.endsWith('.vtt')) return data.file;
+
+  // 2. Strict recursive search: ONLY match .m3u8 strings, NEVER match .vtt or /subtitles/
+  for (const key of Object.keys(data)) {
+    // Skip subtitle blocks completely
+    if (key.toLowerCase().includes('subtitle') || key.toLowerCase().includes('caption') || key.toLowerCase() === 'tracks') {
+      continue;
+    }
+
+    const val = data[key];
+    if (typeof val === 'string') {
+      const isM3u8 = /\.m3u8(\?|$)/i.test(val);
+      const isSubtitle = val.includes('/subtitles/') || val.endsWith('.vtt') || val.endsWith('.srt');
+      if (isM3u8 && !isSubtitle) {
+        return val;
+      }
+    } else if (typeof val === 'object' && val !== null) {
+      const found = findM3u8Url(val);
+      if (found) return found;
     }
   }
+
   return null;
 }
 
