@@ -821,209 +821,305 @@ function parseMasterM3u8(masterText, masterUrl) {
 // -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER (/rating)
 // -------------------------------------------------------------------------
+function streamErrorResponse(errorMessage, failedStepName, targetUrl, res = null, errorDetails = null) {
+  return new Response(JSON.stringify({
+    success: false,
+    error: errorMessage,
+    step: failedStepName,
+    upstreamStatus: res ? res.status : null,
+    upstreamUrl: targetUrl,
+    details: errorDetails
+  }), {
+    status: 502,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+    }
+  });
+}
+
 async function handleStreamRequest(url, request) {
   const anilistId = url.searchParams.get("id") || url.searchParams.get("anilist_id") || url.searchParams.get("anilistId");
   const epNum = url.searchParams.get("e") || url.searchParams.get("ep_num") || url.searchParams.get("ep") || url.searchParams.get("episodeId") || "1";
   const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
 
   const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
-  const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-  // Step 1: Fetch target HTML page
-  const step1Res = await fetch(megaplayUrl, {
-    headers: {
-      'Referer': 'https://megaplay.buzz/',
-      'User-Agent': userAgent,
-      'Origin': 'https://megaplay.buzz'
-    }
-  });
+  // Modern browser headers for Step 1 gateway handshake
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': 'https://megaplay.buzz/'
+  };
 
-  if (!step1Res.ok) {
-    return new Response(JSON.stringify({
-      error: 'Failed to connect to streaming gateway page',
-      debug: { target_url: megaplayUrl, http_code: step1Res.status }
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  const html = await step1Res.text();
-  let fileId = null;
-
-  const titleMatch = html.match(/<title>[^<]*?File\s+(\d+)\s*-[^<]*?<\/title>/i);
-  const megaMatch = html.match(/File\s+(\d+)\s*-\s*MegaPlay/i);
-  const fileMatch = html.match(/File\s+(\d+)/i);
-
-  if (titleMatch) {
-    fileId = titleMatch[1];
-  } else if (megaMatch) {
-    fileId = megaMatch[1];
-  } else if (fileMatch) {
-    fileId = fileMatch[1];
-  }
-
-  if (!fileId) {
-    return new Response(JSON.stringify({
-      error: 'Streaming source token could not be resolved from gateway HTML',
-      debug: { url: megaplayUrl }
-    }), {
-      status: 404,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  // Step 2: Fetch sources from internal API
-  const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
-  const step2Res = await fetch(apiUrl, {
-    headers: {
-      'X-Requested-With': 'XMLHttpRequest',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Referer': 'https://megaplay.buzz/',
-      'User-Agent': userAgent,
-      'Origin': 'https://megaplay.buzz'
-    }
-  });
-
-  if (!step2Res.ok) {
-    return new Response(JSON.stringify({
-      error: 'Failed to resolve streaming paths from internal API gateway',
-      debug: { target_url: apiUrl, http_code: step2Res.status }
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  let sources;
   try {
-    sources = await step2Res.json();
-  } catch (e) {
-    return new Response(JSON.stringify({
-      error: 'Aggregator received corrupted JSON from streaming router API'
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  const m3u8Url = findM3u8Url(sources);
-  if (!m3u8Url) {
-    return new Response(JSON.stringify({
-      error: 'Master stream coordinate playlist (.m3u8) path not found in sources mapping',
-      debug: sources
-    }), {
-      status: 404,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  const subtitles = findSubtitlesRecursive(sources);
-  const intro = findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
-  const outro = findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
-
-  // Step 3: Fetch master playlist text from CDN
-  const masterRes = await fetch(m3u8Url, {
-    headers: {
-      'Referer': 'https://megaplay.buzz/',
-      'Origin': 'https://megaplay.buzz',
-      'User-Agent': userAgent
+    // Step 1: Fetch target HTML page
+    let step1Res;
+    try {
+      step1Res = await fetch(megaplayUrl, {
+        headers: browserHeaders
+      });
+    } catch (err) {
+      return streamErrorResponse(
+        'Failed to connect to streaming gateway page',
+        'step1_fetch_html',
+        megaplayUrl,
+        null,
+        err.message
+      );
     }
-  });
 
-  if (!masterRes.ok) {
-    return new Response(JSON.stringify({
-      error: 'Failed to download master stream configuration playlist from CDN',
-      debug: { m3u8_url: m3u8Url, http_code: masterRes.status }
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+    if (!step1Res.ok) {
+      const errBody = await step1Res.text().catch(() => '');
+      return streamErrorResponse(
+        'Failed to connect to streaming gateway page',
+        'step1_fetch_html',
+        megaplayUrl,
+        step1Res,
+        errBody.substring(0, 300) || `HTTP status ${step1Res.status}`
+      );
+    }
+
+    const html = await step1Res.text();
+    let fileId = null;
+
+    const titleMatch = html.match(/<title>[^<]*?File\s+(\d+)\s*-[^<]*?<\/title>/i);
+    const megaMatch = html.match(/File\s+(\d+)\s*-\s*MegaPlay/i);
+    const getSourcesMatch = html.match(/getSources\?id=(\d+)/i);
+    const dataIdMatch = html.match(/data-id=["'](\d+)["']/i);
+    const fileIdVarMatch = html.match(/(?:file_id|fileId)\s*[:=]\s*["']?(\d+)/i);
+    const fileMatch = html.match(/File\s+(\d+)/i);
+
+    if (titleMatch) {
+      fileId = titleMatch[1];
+    } else if (megaMatch) {
+      fileId = megaMatch[1];
+    } else if (getSourcesMatch) {
+      fileId = getSourcesMatch[1];
+    } else if (dataIdMatch) {
+      fileId = dataIdMatch[1];
+    } else if (fileIdVarMatch) {
+      fileId = fileIdVarMatch[1];
+    } else if (fileMatch) {
+      fileId = fileMatch[1];
+    }
+
+    if (!fileId) {
+      return streamErrorResponse(
+        'Streaming source token could not be resolved from gateway HTML',
+        'step1_extract_file_id',
+        megaplayUrl,
+        step1Res,
+        html.substring(0, 300)
+      );
+    }
+
+    // Extract cookies from Step 1 response and forward to Step 2
+    let cookieHeader = '';
+    if (typeof step1Res.headers.getSetCookie === 'function') {
+      const cookies = step1Res.headers.getSetCookie();
+      if (Array.isArray(cookies) && cookies.length > 0) {
+        cookieHeader = cookies.map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
       }
-    });
-  }
-
-  let masterText = await masterRes.text();
-  masterText = masterText.replace(/^\uFEFF/, '').trimStart();
-
-  if (!masterText.startsWith('#EXTM3U')) {
-    console.error("Upstream CDN returned non-M3U8 payload:", masterText.substring(0, 300));
-    return new Response(JSON.stringify({
-      success: false,
-      error: "CDN returned invalid stream manifest (anti-bot or error page)"
-    }), {
-      status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+    }
+    if (!cookieHeader) {
+      const setCookie = step1Res.headers.get("set-cookie");
+      if (setCookie) {
+        cookieHeader = setCookie.split(/,(?=[^;]+?=)/).map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
       }
-    });
-  }
+    }
 
-  // Step 4: Rewrite the master playlist to route sub-playlists and segments through proxy
-  const rewrittenManifest = rewriteM3u8Manifest(masterText, m3u8Url, url.origin);
+    const apiHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'X-Requested-With': 'XMLHttpRequest',
+      'Referer': megaplayUrl,
+      'Origin': 'https://megaplay.buzz',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin'
+    };
 
-  // Step 7: Server-side fetch and resolve all subtitle caption file contents
-  const subtitleTracks = [];
-  for (const track of subtitles) {
-    if (track.file) {
-      try {
-        const vttRes = await fetch(track.file, {
-          headers: {
-            'Referer': 'https://megaplay.buzz/',
-            'Origin': 'https://megaplay.buzz',
-            'User-Agent': userAgent
-          }
-        });
-        if (vttRes.ok) {
-          const vttText = await vttRes.text();
-          subtitleTracks.push({
-            file: track.file,
-            label: track.label,
-            kind: track.kind,
-            content: vttText
+    if (cookieHeader) {
+      apiHeaders['Cookie'] = cookieHeader;
+    }
+
+    // Step 2: Fetch sources from internal API
+    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
+    let step2Res;
+    try {
+      step2Res = await fetch(apiUrl, {
+        headers: apiHeaders
+      });
+    } catch (err) {
+      return streamErrorResponse(
+        'Failed to resolve streaming paths from internal API gateway',
+        'step2_fetch_sources',
+        apiUrl,
+        null,
+        err.message
+      );
+    }
+
+    if (!step2Res.ok) {
+      const errBody = await step2Res.text().catch(() => '');
+      return streamErrorResponse(
+        'Failed to resolve streaming paths from internal API gateway',
+        'step2_fetch_sources',
+        apiUrl,
+        step2Res,
+        errBody.substring(0, 300) || `HTTP status ${step2Res.status}`
+      );
+    }
+
+    let sources;
+    let rawApiText = '';
+    try {
+      rawApiText = await step2Res.text();
+      sources = JSON.parse(rawApiText);
+    } catch (e) {
+      return streamErrorResponse(
+        'Aggregator received corrupted JSON from streaming router API',
+        'step2_parse_sources_json',
+        apiUrl,
+        step2Res,
+        rawApiText.substring(0, 300) || e.message
+      );
+    }
+
+    const m3u8Url = findM3u8Url(sources);
+    if (!m3u8Url) {
+      return streamErrorResponse(
+        'Master stream coordinate playlist (.m3u8) path not found in sources mapping',
+        'step2_locate_m3u8_url',
+        apiUrl,
+        step2Res,
+        typeof sources === 'object' ? JSON.stringify(sources).substring(0, 300) : String(sources)
+      );
+    }
+
+    const subtitles = findSubtitlesRecursive(sources);
+    const intro = findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
+    const outro = findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
+
+    // Step 3: Fetch master playlist text from CDN
+    const m3u8Headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Referer': 'https://megaplay.buzz/',
+      'Origin': 'https://megaplay.buzz'
+    };
+
+    let masterRes;
+    try {
+      masterRes = await fetch(m3u8Url, {
+        headers: m3u8Headers
+      });
+    } catch (err) {
+      return streamErrorResponse(
+        'Failed to download master stream configuration playlist from CDN',
+        'step3_fetch_master_m3u8',
+        m3u8Url,
+        null,
+        err.message
+      );
+    }
+
+    if (!masterRes.ok) {
+      const errBody = await masterRes.text().catch(() => '');
+      return streamErrorResponse(
+        'Failed to download master stream configuration playlist from CDN',
+        'step3_fetch_master_m3u8',
+        m3u8Url,
+        masterRes,
+        errBody.substring(0, 300) || `HTTP status ${masterRes.status}`
+      );
+    }
+
+    let masterText = await masterRes.text();
+    masterText = masterText.replace(/^\uFEFF/, '').trimStart();
+
+    if (!masterText.startsWith('#EXTM3U')) {
+      console.error("Upstream CDN returned non-M3U8 payload:", masterText.substring(0, 300));
+      return streamErrorResponse(
+        'CDN returned invalid stream manifest (anti-bot or error page)',
+        'step3_validate_extm3u',
+        m3u8Url,
+        masterRes,
+        masterText.substring(0, 300)
+      );
+    }
+
+    // Step 4: Rewrite the master playlist to route sub-playlists and segments through proxy
+    const rewrittenManifest = rewriteM3u8Manifest(masterText, m3u8Url, url.origin);
+
+    // Step 5: Server-side fetch and resolve all subtitle caption file contents
+    const subtitleTracks = [];
+    for (const track of subtitles) {
+      if (track.file) {
+        try {
+          const vttRes = await fetch(track.file, {
+            headers: {
+              'Referer': 'https://megaplay.buzz/',
+              'Origin': 'https://megaplay.buzz',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            }
           });
-        } else {
+          if (vttRes.ok) {
+            const vttText = await vttRes.text();
+            subtitleTracks.push({
+              file: track.file,
+              label: track.label,
+              kind: track.kind,
+              content: vttText
+            });
+          } else {
+            subtitleTracks.push(track);
+          }
+        } catch (err) {
+          console.error(`Failed to download subtitle content for ${track.label}:`, err);
           subtitleTracks.push(track);
         }
-      } catch (err) {
-        console.error(`Failed to download subtitle content for ${track.label}:`, err);
+      } else {
         subtitleTracks.push(track);
       }
-    } else {
-      subtitleTracks.push(track);
     }
-  }
 
-  // Step 8: Return a single fully self-contained response
-  return new Response(JSON.stringify({
-    success: true,
-    manifest: rewrittenManifest,
-    subtitles: subtitleTracks,
-    intro: intro,
-    outro: outro
-  }), {
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    }
-  });
+    // Step 6: Return a single fully self-contained response
+    return new Response(JSON.stringify({
+      success: true,
+      manifest: rewrittenManifest,
+      subtitles: subtitleTracks,
+      intro: intro,
+      outro: outro
+    }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+      }
+    });
+  } catch (unexpectedErr) {
+    console.error("Unexpected failure in handleStreamRequest:", unexpectedErr);
+    return streamErrorResponse(
+      unexpectedErr.message || "Internal stream resolution error",
+      "unhandled_stream_error",
+      url.toString(),
+      null,
+      unexpectedErr.stack || String(unexpectedErr)
+    );
+  }
 }
 
 // -------------------------------------------------------------------------
