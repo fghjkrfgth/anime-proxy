@@ -1039,7 +1039,7 @@ async function handleStreamRequest(url, request) {
     }
 
     // Step 2: Fetch sources from internal API
-    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
+    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}&id=${fileId}`;
     let step2Res;
     try {
       step2Res = await fetch(apiUrl, {
