@@ -323,9 +323,23 @@ async function handleRequest(eventOrReq, envParam) {
 
 // Universal Transparent Proxy Handler for all ?src= media segments and keys
 async function handleTransparentProxy(srcUrl, request, workerUrl) {
+  // Preflight handler for transparent proxy requests
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+        "Access-Control-Max-Age": "86400",
+      },
+    });
+  }
+
   const headers = new Headers();
 
-  // 1. Normalize and attach required anti-leech headers for all third-party media CDNs
+  // 1. Enforce proper upstream anti-leech headers on every outbound segment request
   headers.set("Referer", "https://megaplay.buzz/");
   headers.set("Origin", "https://megaplay.buzz");
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
@@ -335,8 +349,8 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
   headers.set("Sec-Fetch-Mode", "cors");
   headers.set("Sec-Fetch-Site", "cross-site");
 
-  // 2. Forward Range header if requested by HLS player
-  const rangeHeader = request.headers.get("Range");
+  // Forward incoming Range headers unchanged to preserve HTTP 206 Partial Content slicing
+  const rangeHeader = request.headers.get("Range") || request.headers.get("range");
   if (rangeHeader) {
     headers.set("Range", rangeHeader);
   }
@@ -348,30 +362,39 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
     });
 
     // Handle M3U8 Sub-Playlist Rewriting on-the-fly
-    if (srcUrl.toLowerCase().includes(".m3u8") && upstreamResponse.status === 200 && request.method === "GET") {
+    const contentType = (upstreamResponse.headers.get("content-type") || "").toLowerCase();
+    const isM3u8 = srcUrl.toLowerCase().includes(".m3u8") || contentType.includes("mpegurl");
+    if (isM3u8 && upstreamResponse.status === 200 && request.method === "GET") {
       const playlistText = await upstreamResponse.text();
       const rewritten = rewriteM3u8Manifest(playlistText, srcUrl, workerUrl.origin);
 
+      const playlistHeaders = new Headers(upstreamResponse.headers);
+      playlistHeaders.set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8");
+      playlistHeaders.set("Access-Control-Allow-Origin", "*");
+      playlistHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      playlistHeaders.set("Access-Control-Allow-Headers", "*");
+      playlistHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+      playlistHeaders.delete("content-encoding");
+      playlistHeaders.delete("set-cookie");
+
       return new Response(rewritten, {
         status: 200,
-        headers: {
-          "Content-Type": "application/x-mpegURL",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
-        },
+        headers: playlistHeaders,
       });
     }
 
-    // 3. Forward stream response with full CORS and byte-range preservation
+    // Stream upstreamResponse.body directly with its original HTTP status code (200 or 206)
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     responseHeaders.set("Access-Control-Allow-Headers", "*");
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+    responseHeaders.delete("content-encoding");
+    responseHeaders.delete("set-cookie");
 
-    return new Response(upstreamResponse.body, {
+    const responseBody = request.method === "HEAD" ? null : upstreamResponse.body;
+
+    return new Response(responseBody, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers: responseHeaders,
@@ -379,7 +402,13 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
   } catch (err) {
     return new Response(JSON.stringify({ error: err.message, src: srcUrl }), {
       status: 502,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type"
+      },
     });
   }
 }
@@ -394,31 +423,60 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     return playlistText;
   }
 
+  const cleanWorkerOrigin = (workerOrigin || '').replace(/\/+$/, '');
   const lines = playlistText.split(/\r?\n/);
   const rewrittenLines = lines.map(line => {
     let trimmed = line.trim();
     if (!trimmed) return line;
 
+    // Handle tag lines (such as #EXT-X-KEY and #EXT-X-MAP)
     if (trimmed.startsWith('#')) {
       return line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
+        // Prevent recursive URL nesting if already proxied
+        if (cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) {
+          return `URI="${uri}"`;
+        }
+        if (uri.startsWith('/?src=')) {
+          return `URI="${cleanWorkerOrigin}${uri}"`;
+        }
+
         let absUrl;
         try {
-          absUrl = new URL(uri, baseUrl.href).href;
+          const resolved = new URL(uri, baseUrl.href);
+          const isRelative = !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(uri);
+          if (isRelative && !resolved.search && baseUrl.search) {
+            resolved.search = baseUrl.search;
+          }
+          absUrl = resolved.href;
         } catch (e) {
           absUrl = uri;
         }
-        const proxiedUrl = `${workerOrigin}/?src=${encodeURIComponent(absUrl)}`;
+        const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
         return `URI="${proxiedUrl}"`;
       });
     }
 
+    // Prevent recursive URL nesting: if segment or sub-playlist already starts with workerOrigin, do not wrap it again
+    if (cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) {
+      return trimmed;
+    }
+    if (trimmed.startsWith('/?src=')) {
+      return `${cleanWorkerOrigin}${trimmed}`;
+    }
+
+    // Resolve relative segment paths (e.g. seg-1.ts, ../seg-2.txt) against baseUrl.href
     let absSegmentUrl;
     try {
-      absSegmentUrl = new URL(trimmed, baseUrl.href).href;
+      const resolved = new URL(trimmed, baseUrl.href);
+      const isRelative = !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed);
+      if (isRelative && !resolved.search && baseUrl.search) {
+        resolved.search = baseUrl.search;
+      }
+      absSegmentUrl = resolved.href;
     } catch (e) {
       absSegmentUrl = trimmed;
     }
-    return `${workerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`;
+    return `${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`;
   });
 
   return rewrittenLines.join('\n');
@@ -679,6 +737,13 @@ async function handleScheduleRequest(url) {
 // -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
 // -------------------------------------------------------------------------
+// Helper: Detect subtitle tracks or subtitle markers in lines and URLs
+function isSubtitleTrack(str) {
+  if (!str || typeof str !== 'string') return false;
+  const s = str.toLowerCase();
+  return s.includes('/subtitles/') || s.includes('.vtt') || s.includes('.srt') || s.includes('webvtt');
+}
+
 function parseMasterM3u8(masterText, masterUrl) {
   if (!masterText) return masterUrl;
 
@@ -696,6 +761,10 @@ function parseMasterM3u8(masterText, masterUrl) {
 
     // Strictly match STREAM-INF tags and ignore media/subtitles
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      if (isSubtitleTrack(line)) {
+        continue;
+      }
+
       const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
       const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
 
@@ -708,14 +777,9 @@ function parseMasterM3u8(masterText, masterUrl) {
         }
       }
 
-      // Filter out subtitle tracks or non-video playlists
-      if (nextUrl) {
-        const isSubTrack = nextUrl.toLowerCase().includes('/subtitles/') ||
-                           nextUrl.toLowerCase().endsWith('.vtt') ||
-                           nextUrl.toLowerCase().endsWith('.srt') ||
-                           nextUrl.toLowerCase().includes('webvtt');
-
-        if (!isSubTrack && (bandwidth > bestBandwidth || bestUrl === null)) {
+      // Strictly filter out lines containing /subtitles/, .vtt, .srt, or WEBVTT
+      if (nextUrl && !isSubtitleTrack(nextUrl)) {
+        if (bandwidth > bestBandwidth || bestUrl === null) {
           bestBandwidth = bandwidth;
           bestUrl = nextUrl;
         }
@@ -723,10 +787,12 @@ function parseMasterM3u8(masterText, masterUrl) {
     }
   }
 
-  if (!bestUrl) return masterUrl;
+  if (!bestUrl || isSubtitleTrack(bestUrl)) return masterUrl;
 
   try {
-    return new URL(bestUrl, masterUrl).href;
+    const resolved = new URL(bestUrl, masterUrl).href;
+    if (isSubtitleTrack(resolved)) return masterUrl;
+    return resolved;
   } catch (e) {
     return bestUrl;
   }
@@ -741,7 +807,7 @@ async function handleStreamRequest(url, request) {
   const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
 
   const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
-  const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+  const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
   // Step 1: Fetch target HTML page
   const step1Res = await fetch(megaplayUrl, {
@@ -882,22 +948,41 @@ async function handleStreamRequest(url, request) {
   let variantText = '';
   let finalPlaylistUrl = variantUrl;
 
-  try {
-    const variantRes = await fetch(variantUrl, {
-      headers: {
-        'Referer': 'https://megaplay.buzz/',
-        'Origin': 'https://megaplay.buzz',
-        'User-Agent': userAgent
-      }
-    });
+  if (variantUrl && variantUrl !== m3u8Url) {
+    try {
+      const variantRes = await fetch(variantUrl, {
+        headers: {
+          'Referer': 'https://megaplay.buzz/',
+          'Origin': 'https://megaplay.buzz',
+          'User-Agent': userAgent
+        }
+      });
 
-    if (variantRes.ok) {
-      variantText = await variantRes.text();
-    } else {
+      if (variantRes.ok) {
+        const text = await variantRes.text();
+        if (text && (text.includes('#EXTM3U') || text.includes('#EXTINF:') || text.includes('#EXT-X-STREAM-INF:'))) {
+          variantText = text;
+        } else {
+          // If body is not a valid manifest, fall back seamlessly to m3u8Url
+          variantText = masterText;
+          finalPlaylistUrl = m3u8Url;
+        }
+      } else {
+        // If downloading variantUrl fails or yields a 404, fall back seamlessly to m3u8Url
+        variantText = masterText;
+        finalPlaylistUrl = m3u8Url;
+      }
+    } catch (e) {
+      // Network failure: fall back seamlessly to m3u8Url
       variantText = masterText;
       finalPlaylistUrl = m3u8Url;
     }
-  } catch (e) {
+  } else {
+    variantText = masterText;
+    finalPlaylistUrl = m3u8Url;
+  }
+
+  if (!variantText || !variantText.trim()) {
     variantText = masterText;
     finalPlaylistUrl = m3u8Url;
   }
