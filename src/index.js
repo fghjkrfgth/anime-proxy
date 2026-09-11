@@ -415,23 +415,34 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
 
 // Helper: Rewrite M3U8 manifest segments and URI attributes to proxy URLs
 function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
-  if (!playlistText) return '';
+  if (!playlistText || typeof playlistText !== 'string') return '';
+  const sanitizedText = playlistText.replace(/^\uFEFF/, '').trimStart();
+  if (!sanitizedText) return '';
+
   let baseUrl;
   try {
     baseUrl = new URL(targetUrl);
   } catch (e) {
-    return playlistText;
+    return sanitizedText.startsWith('#EXTM3U') ? sanitizedText : `#EXTM3U\n${sanitizedText}`;
   }
 
   const cleanWorkerOrigin = (workerOrigin || '').replace(/\/+$/, '');
-  const lines = playlistText.split(/\r?\n/);
-  const rewrittenLines = lines.map(line => {
-    let trimmed = line.trim();
-    if (!trimmed) return line;
+  const lines = sanitizedText.split(/\r?\n/);
+  const rewrittenLines = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (rewrittenLines.length > 0) {
+        rewrittenLines.push('');
+      }
+      continue;
+    }
 
     // Handle tag lines (such as #EXT-X-KEY and #EXT-X-MAP)
     if (trimmed.startsWith('#')) {
-      return line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
+      const tagRewritten = line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
         // Prevent recursive URL nesting if already proxied
         if (cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) {
           return `URI="${uri}"`;
@@ -454,14 +465,18 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
         const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
         return `URI="${proxiedUrl}"`;
       });
+      rewrittenLines.push(tagRewritten);
+      continue;
     }
 
     // Prevent recursive URL nesting: if segment or sub-playlist already starts with workerOrigin, do not wrap it again
     if (cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) {
-      return trimmed;
+      rewrittenLines.push(trimmed);
+      continue;
     }
     if (trimmed.startsWith('/?src=')) {
-      return `${cleanWorkerOrigin}${trimmed}`;
+      rewrittenLines.push(`${cleanWorkerOrigin}${trimmed}`);
+      continue;
     }
 
     // Resolve relative segment paths (e.g. seg-1.ts, ../seg-2.txt) against baseUrl.href
@@ -476,8 +491,13 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     } catch (e) {
       absSegmentUrl = trimmed;
     }
-    return `${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`;
-  });
+    rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`);
+  }
+
+  // Guarantee the very first line of the output is always #EXTM3U
+  if (rewrittenLines.length === 0 || !rewrittenLines[0].startsWith('#EXTM3U')) {
+    rewrittenLines.unshift('#EXTM3U');
+  }
 
   return rewrittenLines.join('\n');
 }
@@ -939,56 +959,25 @@ async function handleStreamRequest(url, request) {
     });
   }
 
-  const masterText = await masterRes.text();
+  let masterText = await masterRes.text();
+  masterText = masterText.replace(/^\uFEFF/, '').trimStart();
 
-  // Step 4: Parse master playlist and find highest quality variant URL
-  let variantUrl = parseMasterM3u8(masterText, m3u8Url) || m3u8Url;
-
-  // Step 5: Fetch highest quality variant playlist text, with automatic fallback to master
-  let variantText = '';
-  let finalPlaylistUrl = variantUrl;
-
-  if (variantUrl && variantUrl !== m3u8Url) {
-    try {
-      const variantRes = await fetch(variantUrl, {
-        headers: {
-          'Referer': 'https://megaplay.buzz/',
-          'Origin': 'https://megaplay.buzz',
-          'User-Agent': userAgent
-        }
-      });
-
-      if (variantRes.ok) {
-        const text = await variantRes.text();
-        if (text && (text.includes('#EXTM3U') || text.includes('#EXTINF:') || text.includes('#EXT-X-STREAM-INF:'))) {
-          variantText = text;
-        } else {
-          // If body is not a valid manifest, fall back seamlessly to m3u8Url
-          variantText = masterText;
-          finalPlaylistUrl = m3u8Url;
-        }
-      } else {
-        // If downloading variantUrl fails or yields a 404, fall back seamlessly to m3u8Url
-        variantText = masterText;
-        finalPlaylistUrl = m3u8Url;
+  if (!masterText.startsWith('#EXTM3U')) {
+    console.error("Upstream CDN returned non-M3U8 payload:", masterText.substring(0, 300));
+    return new Response(JSON.stringify({
+      success: false,
+      error: "CDN returned invalid stream manifest (anti-bot or error page)"
+    }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
       }
-    } catch (e) {
-      // Network failure: fall back seamlessly to m3u8Url
-      variantText = masterText;
-      finalPlaylistUrl = m3u8Url;
-    }
-  } else {
-    variantText = masterText;
-    finalPlaylistUrl = m3u8Url;
+    });
   }
 
-  if (!variantText || !variantText.trim()) {
-    variantText = masterText;
-    finalPlaylistUrl = m3u8Url;
-  }
-
-  // Step 6: Rewrite the playlist relative/absolute URLs to use our proxy
-  const rewrittenManifest = rewriteM3u8Manifest(variantText, finalPlaylistUrl, url.origin);
+  // Step 4: Rewrite the master playlist to route sub-playlists and segments through proxy
+  const rewrittenManifest = rewriteM3u8Manifest(masterText, m3u8Url, url.origin);
 
   // Step 7: Server-side fetch and resolve all subtitle caption file contents
   const subtitleTracks = [];
