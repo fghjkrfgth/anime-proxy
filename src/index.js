@@ -260,13 +260,19 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleFranchiseRequest(slug, id, userAgent);
   }
 
-  // 4. OBFUSCATED ROUTE: Media & Stream Resolution (/rating?e={episodeId}&id={anilistId}&lang={lang})
+  // 4. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
+  const srcUrl = url.searchParams.get("src");
+  if (srcUrl && action !== "proxy_caption") {
+    return await handleTransparentProxy(srcUrl, request, url);
+  }
+
+  // 5. OBFUSCATED ROUTE: Media & Stream Resolution (/rating?e={episodeId}&id={anilistId}&lang={lang})
   const hasStreamParams = url.searchParams.has("e") || url.searchParams.has("ep_num") || url.searchParams.has("ep") || url.searchParams.has("episodeId");
   if (url.pathname === "/rating" || action === "rating" || url.pathname === "/api/stream" || url.pathname === "/api/media" || (hasStreamParams && action !== "proxy_caption" && action !== "schedule")) {
     return await handleStreamRequest(url, request);
   }
 
-  // 4. ROUTING PIPELINE: Subtitle VTT Caption Proxy
+  // 6. ROUTING PIPELINE: Subtitle VTT Caption Proxy
   if (action === "proxy_caption") {
     const vttUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src");
     if (!vttUrl) {
@@ -309,8 +315,6 @@ async function handleRequest(eventOrReq, envParam) {
     }
   }
 
-  // 5. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
-  const srcUrl = url.searchParams.get("src");
   if (srcUrl) {
     return await handleTransparentProxy(srcUrl, request, url);
   }
@@ -339,17 +343,16 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
 
   const headers = new Headers();
 
-  // 1. Enforce proper upstream anti-leech headers on every outbound segment request
+  // Send complete modern browser headers on every media chunk/manifest fetch
   headers.set("Referer", "https://megaplay.buzz/");
   headers.set("Origin", "https://megaplay.buzz");
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
   headers.set("Accept", "*/*");
-  headers.set("Accept-Language", "en-US,en;q=0.9");
   headers.set("Sec-Fetch-Dest", "empty");
   headers.set("Sec-Fetch-Mode", "cors");
   headers.set("Sec-Fetch-Site", "cross-site");
 
-  // Forward incoming Range headers unchanged to preserve HTTP 206 Partial Content slicing
+  // Forward incoming Range headers unchanged to preserve byte-range slicing (HTTP 206 Partial Content)
   const rangeHeader = request.headers.get("Range") || request.headers.get("range");
   if (rangeHeader) {
     headers.set("Range", rangeHeader);
@@ -383,7 +386,7 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
       });
     }
 
-    // Stream upstreamResponse.body directly with its original HTTP status code (200 or 206)
+    // Stream upstreamResponse.body directly with its original HTTP status code (upstreamResponse.status)
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -396,7 +399,6 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
 
     return new Response(responseBody, {
       status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
       headers: responseHeaders,
     });
   } catch (err) {
@@ -430,6 +432,23 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   const lines = sanitizedText.split(/\r?\n/);
   const rewrittenLines = [];
 
+  // Helper to resolve URI and preserve access query parameters
+  const resolveTargetUri = (rawUri) => {
+    let absUrl;
+    try {
+      const resolved = new URL(rawUri, baseUrl.href);
+      // If the parent master/variant URL contains query parameters (baseUrl.search)
+      // and the child segment/tag URI does not already carry query parameters, preserve access
+      if (baseUrl.search && !resolved.search) {
+        resolved.search = baseUrl.search;
+      }
+      absUrl = resolved.href;
+    } catch (e) {
+      absUrl = rawUri;
+    }
+    return absUrl;
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
@@ -440,190 +459,263 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       continue;
     }
 
-    // Handle tag lines (such as #EXT-X-KEY and #EXT-X-MAP)
+    // Handle tag lines (such as #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.)
     if (trimmed.startsWith('#')) {
-      const tagRewritten = line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
-        // Prevent recursive URL nesting if already proxied
-        if (cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) {
-          return `URI="${uri}"`;
-        }
-        if (uri.startsWith('/?src=')) {
-          return `URI="${cleanWorkerOrigin}${uri}"`;
-        }
-
-        let absUrl;
-        try {
-          const resolved = new URL(uri, baseUrl.href);
-          const isRelative = !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(uri);
-          if (isRelative && !resolved.search && baseUrl.search) {
-            resolved.search = baseUrl.search;
+      if (/URI=/i.test(trimmed)) {
+        const tagRewritten = line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
+          // Prevent recursive proxy wrapping: if URI already starts with cleanWorkerOrigin or /?src=, leave unmodified
+          if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
+            return `URI="${uri}"`;
           }
-          absUrl = resolved.href;
-        } catch (e) {
-          absUrl = uri;
-        }
-        const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
-        return `URI="${proxiedUrl}"`;
-      });
-      rewrittenLines.push(tagRewritten);
+
+          const absUrl = resolveTargetUri(uri);
+          const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
+          return `URI="${proxiedUrl}"`;
+        });
+        rewrittenLines.push(tagRewritten);
+        continue;
+      }
+      rewrittenLines.push(line);
       continue;
     }
 
-    // Prevent recursive URL nesting: if segment or sub-playlist already starts with workerOrigin, do not wrap it again
-    if (cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) {
+    // Segment or sub-playlist URL line
+    // Prevent recursive proxy wrapping: if line already starts with cleanWorkerOrigin or /?src=, leave it unmodified
+    if ((cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) || trimmed.startsWith('/?src=')) {
       rewrittenLines.push(trimmed);
       continue;
     }
-    if (trimmed.startsWith('/?src=')) {
-      rewrittenLines.push(`${cleanWorkerOrigin}${trimmed}`);
-      continue;
-    }
 
-    // Resolve relative segment paths (e.g. seg-1.ts, ../seg-2.txt) against baseUrl.href
-    let absSegmentUrl;
-    try {
-      const resolved = new URL(trimmed, baseUrl.href);
-      const isRelative = !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed);
-      if (isRelative && !resolved.search && baseUrl.search) {
-        resolved.search = baseUrl.search;
-      }
-      absSegmentUrl = resolved.href;
-    } catch (e) {
-      absSegmentUrl = trimmed;
-    }
+    // Resolve relative segment paths against baseUrl.href and preserve access tokens
+    const absSegmentUrl = resolveTargetUri(trimmed);
     rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`);
   }
 
-  // Guarantee the very first line of the output is always #EXTM3U
+  // Ensure leading UTF-8 BOM or blank characters are removed and output strictly begins with #EXTM3U
+  while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
+    rewrittenLines.shift();
+  }
   if (rewrittenLines.length === 0 || !rewrittenLines[0].startsWith('#EXTM3U')) {
     rewrittenLines.unshift('#EXTM3U');
   }
 
-  return rewrittenLines.join('\n');
+  return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
 }
 
-// Helper: HTML entity decoder
-function htmlEntityDecode(str) {
-  if (!str) return '';
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&#39;/g, "'")
-    .replace(/&#039;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/&nbsp;/g, ' ');
+// Helper: Detect and ignore subtitle or caption tracks
+function isIgnoredTrack(str) {
+  if (!str || typeof str !== 'string') return false;
+  const s = str.toLowerCase();
+  return s.includes('/subtitles/') || s.includes('.vtt') || s.includes('.srt') || s.includes('webvtt');
 }
 
-// Helper: Discover master manifest path (.m3u8) or alternative video stream URL
+// Helper: Clean and decode URL strings, including URI-encoded m3u8 strings
+function cleanAndDecodeUrl(val) {
+  if (typeof val !== 'string' || !val) return null;
+  let trimmed = val.trim();
+  if (trimmed.includes('%') && trimmed.toLowerCase().includes('m3u8')) {
+    try {
+      const decoded = decodeURIComponent(trimmed);
+      if (/\.m3u8(\?|$)/i.test(decoded)) {
+        trimmed = decoded;
+      }
+    } catch (e) {}
+  }
+  return trimmed;
+}
+
+// Helper: Gracefully handle encrypted or encoded payloads returned by /stream/getSources
+function attemptDecryptSources(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+
+  const encData = payload.enc || payload.encrypted || (typeof payload.sources === 'string' ? payload.sources : null);
+  if (!encData || typeof encData !== 'string') return null;
+
+  const trimmed = encData.trim();
+
+  // 1. URL encoded string check
+  if (trimmed.includes('%')) {
+    try {
+      const decoded = decodeURIComponent(trimmed);
+      if (decoded && decoded !== trimmed) {
+        try {
+          const parsed = JSON.parse(decoded);
+          if (parsed && typeof parsed === 'object') return parsed;
+        } catch (e) {}
+        if (/\.m3u8(\?|$)/i.test(decoded)) {
+          return { sources: [{ file: decoded }] };
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 2. Base64 encoded payload check
+  try {
+    const raw = atob(trimmed);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch (e) {}
+      if (/\.m3u8(\?|$)/i.test(raw)) {
+        return { sources: [{ file: raw }] };
+      }
+      if (/^https?:\/\//i.test(raw)) {
+        return { sources: [{ file: raw }] };
+      }
+    }
+  } catch (e) {}
+
+  // 3. URL-safe Base64 encoded check
+  try {
+    const sanitized = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = sanitized.length % 4;
+    const padded = pad ? sanitized + '='.repeat(4 - pad) : sanitized;
+    const raw = atob(padded);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch (e) {}
+      if (/\.m3u8(\?|$)/i.test(raw)) {
+        return { sources: [{ file: raw }] };
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+// Helper: Discover master manifest path (.m3u8) or alternative video stream URL with strict prioritization
 function findM3u8Url(data) {
   if (!data) return null;
 
-  // 1. Direct string checking (in case sources is a raw URL string)
-  if (typeof data === 'string') {
-    let str = data.trim();
-    if (str.includes('%') && str.toLowerCase().includes('m3u8')) {
-      try {
-        const decoded = decodeURIComponent(str);
-        if (/\.m3u8(\?|$)/i.test(decoded)) return decoded;
-      } catch (e) {}
+  const checkM3u8String = (str) => {
+    const cleaned = cleanAndDecodeUrl(str);
+    if (!cleaned) return null;
+    if (/\.m3u8(\?|$)/i.test(cleaned) && !isIgnoredTrack(cleaned)) {
+      return cleaned;
     }
-    if (/\.m3u8(\?|$)/i.test(str)) return str;
-    if (/^https?:\/\/.*\.(mp4|mkv|webm)(\?|$)/i.test(str)) return str;
     return null;
-  }
+  };
 
-  if (typeof data !== 'object') return null;
+  const checkFallbackVideoString = (str) => {
+    if (typeof str !== 'string' || !str) return null;
+    const trimmed = str.trim();
+    if (isIgnoredTrack(trimmed)) return null;
+    if (/^https?:\/\/.*\.(mp4|mkv|webm)(\?|$)/i.test(trimmed)) {
+      return trimmed;
+    }
+    if (/^https?:\/\//i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
+      return trimmed;
+    }
+    return null;
+  };
 
-  // 2. Direct check in sources array (sources: [{ file: '...m3u8', url: '...', stream: '...', link: '...' }])
-  const sourcesArr = Array.isArray(data.sources)
-    ? data.sources
-    : (data.data && Array.isArray(data.data.sources) ? data.data.sources : null);
+  // PASS 1: Strictly prioritize .m3u8 across all structures
+  const findM3u8Strict = (node) => {
+    if (!node) return null;
+    if (typeof node === 'string') {
+      return checkM3u8String(node);
+    }
+    if (typeof node !== 'object') return null;
 
-  if (sourcesArr) {
-    for (const src of sourcesArr) {
-      if (!src) continue;
-      if (typeof src === 'string') {
-        const found = findM3u8Url(src);
-        if (found) return found;
-      }
-      const candidates = [src.file, src.url, src.stream, src.link, src.src];
-      for (const candidate of candidates) {
-        if (typeof candidate === 'string' && candidate) {
-          let trimmed = candidate.trim();
-          if (trimmed.includes('%') && trimmed.toLowerCase().includes('m3u8')) {
-            try {
-              const decoded = decodeURIComponent(trimmed);
-              if (/\.m3u8(\?|$)/i.test(decoded)) trimmed = decoded;
-            } catch (e) {}
+    const sourcesArr = Array.isArray(node.sources)
+      ? node.sources
+      : (node.data && Array.isArray(node.data.sources) ? node.data.sources : (Array.isArray(node) ? node : null));
+
+    if (sourcesArr) {
+      for (const item of sourcesArr) {
+        if (!item) continue;
+        if (typeof item === 'string') {
+          const m = checkM3u8String(item);
+          if (m) return m;
+        } else if (typeof item === 'object') {
+          for (const c of [item.file, item.url, item.stream, item.link, item.src, item.video]) {
+            const m = checkM3u8String(c);
+            if (m) return m;
           }
-          if (/\.m3u8(\?|$)/i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
-            return trimmed;
+          const nested = findM3u8Strict(item);
+          if (nested) return nested;
+        }
+      }
+    }
+
+    const directKeys = ['file', 'video', 'url', 'stream', 'link', 'src', 'sources', 'data', 'iframe', 'embed'];
+    for (const key of directKeys) {
+      if (node[key] !== undefined && node[key] !== null) {
+        if (typeof node[key] === 'string') {
+          const m = checkM3u8String(node[key]);
+          if (m) return m;
+        } else if (typeof node[key] === 'object') {
+          const m = findM3u8Strict(node[key]);
+          if (m) return m;
+        }
+      }
+    }
+
+    for (const key of Object.keys(node)) {
+      const lowerKey = key.toLowerCase();
+      if (lowerKey === 'tracks' || lowerKey === 'subtitles' || lowerKey === 'captions' || lowerKey === 'intro' || lowerKey === 'outro') {
+        continue;
+      }
+      const val = node[key];
+      if (typeof val === 'string') {
+        const m = checkM3u8String(val);
+        if (m) return m;
+      } else if (typeof val === 'object' && val !== null) {
+        const m = findM3u8Strict(val);
+        if (m) return m;
+      }
+    }
+
+    return null;
+  };
+
+  const m3u8Match = findM3u8Strict(data);
+  if (m3u8Match) return m3u8Match;
+
+  // PASS 2: Fallback to direct video streams if no .m3u8 exists
+  const findFallbackStrict = (node) => {
+    if (!node) return null;
+    if (typeof node === 'string') {
+      return checkFallbackVideoString(node);
+    }
+    if (typeof node !== 'object') return null;
+
+    const sourcesArr = Array.isArray(node.sources)
+      ? node.sources
+      : (node.data && Array.isArray(node.data.sources) ? node.data.sources : (Array.isArray(node) ? node : null));
+
+    if (sourcesArr) {
+      for (const item of sourcesArr) {
+        if (!item) continue;
+        if (typeof item === 'string') {
+          const fb = checkFallbackVideoString(item);
+          if (fb) return fb;
+        } else if (typeof item === 'object') {
+          for (const c of [item.file, item.url, item.stream, item.link, item.src, item.video]) {
+            const fb = checkFallbackVideoString(c);
+            if (fb) return fb;
           }
         }
       }
     }
-  }
 
-  // 3. Direct top-level fields (file, video, url, stream, link, iframe, embed, src)
-  const directFields = ['file', 'video', 'url', 'stream', 'link', 'src', 'iframe', 'embed'];
-  for (const field of directFields) {
-    const val = data[field] || (data.data && data.data[field]);
-    if (typeof val === 'string' && val) {
-      let trimmed = val.trim();
-      if (trimmed.includes('%') && trimmed.toLowerCase().includes('m3u8')) {
-        try {
-          const decoded = decodeURIComponent(trimmed);
-          if (/\.m3u8(\?|$)/i.test(decoded)) trimmed = decoded;
-        } catch (e) {}
-      }
-      if (/\.m3u8(\?|$)/i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
-        return trimmed;
+    for (const key of ['stream', 'link', 'file', 'video', 'url', 'src']) {
+      const val = node[key] || (node.data && node.data[key]);
+      if (typeof val === 'string') {
+        const fb = checkFallbackVideoString(val);
+        if (fb) return fb;
       }
     }
-  }
 
-  // 4. Fallback to direct video stream (e.g. mp4, or stream URL)
-  for (const field of ['stream', 'link', 'file', 'video', 'url', 'src']) {
-    const val = data[field] || (data.data && data.data[field]);
-    if (typeof val === 'string' && val) {
-      const trimmed = val.trim();
-      if (/^https?:\/\//i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
-        return trimmed;
-      }
-    }
-  }
+    return null;
+  };
 
-  // 5. Recursive search (strictly skip subtitle, track, caption, intro, outro keys)
-  for (const key of Object.keys(data)) {
-    const lowerKey = key.toLowerCase();
-    if (lowerKey === 'tracks' || lowerKey === 'subtitles' || lowerKey === 'captions' || lowerKey === 'intro' || lowerKey === 'outro') {
-      continue;
-    }
-
-    const val = data[key];
-    if (typeof val === 'string' && val) {
-      let trimmed = val.trim();
-      if (trimmed.includes('%') && trimmed.toLowerCase().includes('m3u8')) {
-        try {
-          const decoded = decodeURIComponent(trimmed);
-          if (/\.m3u8(\?|$)/i.test(decoded)) trimmed = decoded;
-        } catch (e) {}
-      }
-      if (/\.m3u8(\?|$)/i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
-        return trimmed;
-      }
-    } else if (typeof val === 'object' && val !== null) {
-      const nested = findM3u8Url(val);
-      if (nested) return nested;
-    }
-  }
-
-  return null;
+  return findFallbackStrict(data);
 }
+
 
 // Helper: Locate subtitle tracks
 function findSubtitlesRecursive(arr) {
@@ -840,70 +932,6 @@ async function handleScheduleRequest(url) {
 }
 
 // -------------------------------------------------------------------------
-// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER
-// -------------------------------------------------------------------------
-// Helper: Detect subtitle tracks or subtitle markers in lines and URLs
-function isSubtitleTrack(str) {
-  if (!str || typeof str !== 'string') return false;
-  const s = str.toLowerCase();
-  return s.includes('/subtitles/') || s.includes('.vtt') || s.includes('.srt') || s.includes('webvtt');
-}
-
-function parseMasterM3u8(masterText, masterUrl) {
-  if (!masterText) return masterUrl;
-
-  // If already a media playlist containing media chunks, return master URL directly
-  if (masterText.includes('#EXTINF:')) {
-    return masterUrl;
-  }
-
-  const lines = masterText.split(/\r?\n/);
-  let bestBandwidth = -1;
-  let bestUrl = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-
-    // Strictly match STREAM-INF tags and ignore media/subtitles
-    if (line.startsWith('#EXT-X-STREAM-INF:')) {
-      if (isSubtitleTrack(line)) {
-        continue;
-      }
-
-      const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
-      const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-
-      let nextUrl = null;
-      for (let j = i + 1; j < lines.length; j++) {
-        const subLine = lines[j].trim();
-        if (subLine && !subLine.startsWith('#')) {
-          nextUrl = subLine;
-          break;
-        }
-      }
-
-      // Strictly filter out lines containing /subtitles/, .vtt, .srt, or WEBVTT
-      if (nextUrl && !isSubtitleTrack(nextUrl)) {
-        if (bandwidth > bestBandwidth || bestUrl === null) {
-          bestBandwidth = bandwidth;
-          bestUrl = nextUrl;
-        }
-      }
-    }
-  }
-
-  if (!bestUrl || isSubtitleTrack(bestUrl)) return masterUrl;
-
-  try {
-    const resolved = new URL(bestUrl, masterUrl).href;
-    if (isSubtitleTrack(resolved)) return masterUrl;
-    return resolved;
-  } catch (e) {
-    return bestUrl;
-  }
-}
-
-// -------------------------------------------------------------------------
 // RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER (/rating)
 // -------------------------------------------------------------------------
 function streamErrorResponse(errorMessage, failedStepName, targetUrl, res = null, errorDetails = null) {
@@ -1039,7 +1067,7 @@ async function handleStreamRequest(url, request) {
     }
 
     // Step 2: Fetch sources from internal API
-    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}&id=${fileId}`;
+    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
     let step2Res;
     try {
       step2Res = await fetch(apiUrl, {
@@ -1081,29 +1109,57 @@ async function handleStreamRequest(url, request) {
       );
     }
 
+    // Support both plaintext source formats and encoded payloads:
+    // If the API returns { enc: "..." }, handle the decryption step gracefully or inspect fallback keys/sources
+    let decryptedPayload = null;
+    if (sources && typeof sources === 'object') {
+      const hasEnc = Boolean(sources.enc || sources.encrypted || (typeof sources.sources === 'string' && !sources.sources.startsWith('http')));
+      if (hasEnc) {
+        try {
+          decryptedPayload = attemptDecryptSources(sources);
+        } catch (decryptErr) {
+          console.warn("[Stream Decryption Notice] Gracefully proceeding after decryption attempt:", decryptErr.message);
+        }
+      }
+    }
+
     let m3u8Url = null;
     try {
-      m3u8Url = findM3u8Url(sources);
+      if (decryptedPayload) {
+        m3u8Url = findM3u8Url(decryptedPayload);
+      }
+      if (!m3u8Url) {
+        m3u8Url = findM3u8Url(sources);
+      }
     } catch (err) {
       console.error("[Stream Extraction Error]:", err);
     }
 
     if (!m3u8Url) {
-      console.warn("Stream playlist URL not resolved from upstream sources. Received sources keys:", Object.keys(sources || {}), "Payload preview:", JSON.stringify(sources).substring(0, 500));
+      const receivedKeys = (sources && typeof sources === 'object') ? Object.keys(sources) : [];
+      console.warn("Stream playlist URL not resolved from upstream sources. Received keys:", receivedKeys);
       return new Response(JSON.stringify({
         success: false,
         error: "Stream playlist URL not resolved from upstream sources",
         step: "source_extraction",
+        keys: receivedKeys,
         receivedSources: sources
       }), {
         status: 404,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+        }
       });
     }
 
-    const subtitles = findSubtitlesRecursive(sources);
-    const intro = findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
-    const outro = findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
+    const subtitles = (decryptedPayload && findSubtitlesRecursive(decryptedPayload)?.length > 0)
+      ? findSubtitlesRecursive(decryptedPayload)
+      : findSubtitlesRecursive(sources);
+    const intro = findSkipTimesRecursive(decryptedPayload, 'intro') || findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
+    const outro = findSkipTimesRecursive(decryptedPayload, 'outro') || findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
 
     // Step 3: Fetch master playlist text from CDN
     const m3u8Headers = {
