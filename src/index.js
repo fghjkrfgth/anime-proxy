@@ -442,6 +442,49 @@ async function handleServerListRequest(url) {
 }
 
 // -------------------------------------------------------------------------
+// MASTER MANIFEST AUDIO ADJUSTER (FOR DEMUXED STREAMS)
+// -------------------------------------------------------------------------
+function adjustMasterManifestAudio(masterText, preferredLang) {
+  if (!masterText || typeof masterText !== 'string') return '';
+  const lines = masterText.split(/\r?\n/);
+  const adjusted = [];
+
+  for (let line of lines) {
+    let trimmed = line.trim();
+    if (trimmed.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
+      const isEnglish = /LANGUAGE=["']eng["']|NAME=["']English["']/i.test(trimmed);
+      const isNative = /LANGUAGE=["']jpn["']|NAME=["']Native["']|NAME=["']Japanese["']/i.test(trimmed);
+
+      if (preferredLang === "dub") {
+        if (isEnglish) {
+          trimmed = trimmed
+            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=YES")
+            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=YES");
+          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
+          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
+        } else if (isNative) {
+          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
+        }
+      } else {
+        // sub / native
+        if (isNative) {
+          trimmed = trimmed
+            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=YES")
+            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=YES");
+          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
+          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
+        } else if (isEnglish) {
+          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
+        }
+      }
+    }
+    adjusted.push(trimmed);
+  }
+
+  return adjusted.join('\n');
+}
+
+// -------------------------------------------------------------------------
 // FLIXCLOUD WORKFLOW: STEP 2, 3, 4, 5 (PAGE SCRAPE, TOKEN, DECRYPT, PARSE)
 // -------------------------------------------------------------------------
 async function handleFlixCloudStreamRequest(url, request) {
@@ -643,85 +686,20 @@ async function handleFlixCloudStreamRequest(url, request) {
 
     const masterManifestText = await masterManifestRes.text();
 
-    let matchedAudioUri = null;
-    let videoStreamUri = null;
+    // 3. MASTER MANIFEST RENDITIONS (DEMUXED AUDIO & VIDEO HANDLING)
+    let finalManifestText = masterManifestText;
+    const finalManifestUrl = parseUrl;
 
-    const masterLines = masterManifestText.split(/\r?\n/);
-    for (let i = 0; i < masterLines.length; i++) {
-      const line = masterLines[i].trim();
-      if (line.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
-        const isEnglish = /LANGUAGE=["']eng["']|NAME=["']English["']/i.test(line);
-        const isNative = /LANGUAGE=["']jpn["']|NAME=["']Native["']|NAME=["']Japanese["']/i.test(line);
-        const uriMatch = line.match(/URI=["']([^"']+)["']/i);
-        if (uriMatch) {
-          let resolvedUri = uriMatch[1];
-          try { resolvedUri = new URL(resolvedUri, parseUrl).toString(); } catch (e) { }
-
-          if (lang === "dub" && isEnglish) {
-            matchedAudioUri = resolvedUri;
-          } else if (lang === "sub" && isNative) {
-            matchedAudioUri = resolvedUri;
-          }
-        }
-      } else if (line.startsWith("#EXT-X-STREAM-INF:")) {
-        for (let j = i + 1; j < masterLines.length; j++) {
-          const nextLine = masterLines[j].trim();
-          if (nextLine && !nextLine.startsWith("#")) {
-            try { videoStreamUri = new URL(nextLine, parseUrl).toString(); } catch (e) { videoStreamUri = nextLine; }
-            break;
-          }
-        }
-      }
-    }
-
-    let targetManifestText = null;
-    let targetManifestUrl = null;
-
-    if (matchedAudioUri) {
-      try {
-        const renditionRes = await fetch(matchedAudioUri, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-          }
-        });
-        if (renditionRes.ok) {
-          const rText = await renditionRes.text();
-          if (rText && rText.includes("#EXTM3U")) {
-            targetManifestText = rText;
-            targetManifestUrl = matchedAudioUri;
-          }
-        }
-      } catch (e) {
-        console.warn("[Rendition Fetch] Audio rendition fetch failed:", e);
-      }
-    }
-
-    if (!targetManifestText && videoStreamUri) {
-      try {
-        const vRes = await fetch(videoStreamUri, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-          }
-        });
-        if (vRes.ok) {
-          const vText = await vRes.text();
-          if (vText && vText.includes("#EXTM3U")) {
-            targetManifestText = vText;
-            targetManifestUrl = videoStreamUri;
-          }
-        }
-      } catch (e) {
-        console.warn("[Video Rendition Fetch] Video stream fetch failed:", e);
-      }
-    }
-
-    if (!targetManifestText) {
-      targetManifestText = masterManifestText;
-      targetManifestUrl = parseUrl;
+    if (masterManifestText.includes("#EXT-X-STREAM-INF")) {
+      // Demuxed HLS master playlist: adjust default audio track to requested lang (sub vs dub)
+      // while keeping all audio renditions available for dynamic in-player track switching
+      finalManifestText = adjustMasterManifestAudio(masterManifestText, lang);
+    } else {
+      finalManifestText = masterManifestText;
     }
 
     // 4. REWRITE MANIFEST & PROXY SEGMENTS
-    const rewrittenManifest = rewriteM3u8Manifest(targetManifestText, targetManifestUrl, url.origin);
+    const rewrittenManifest = rewriteM3u8Manifest(finalManifestText, finalManifestUrl, url.origin);
 
     // 5. API RESPONSE STRUCTURE
     const extractedSubtitles = (rawSubtitles || []).map(s => {
