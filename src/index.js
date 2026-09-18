@@ -91,101 +91,9 @@ async function verifyToken(tokenStr, secretStr = JWT_SECRET) {
   }
 }
 
-// -------------------------------------------------------------------------
-// IN-MEMORY ASS/SSA TO WEBVTT CONVERTER
-// -------------------------------------------------------------------------
-function assTimestampToVtt(ts) {
-  const parts = ts.trim().split(':');
-  if (parts.length === 3) {
-    let hours = parts[0].padStart(2, '0');
-    let minutes = parts[1].padStart(2, '0');
-    let [seconds, centis] = parts[2].split('.');
-    seconds = (seconds || '00').padStart(2, '0');
-    centis = (centis || '00').padEnd(3, '0').slice(0, 3);
-    return `${hours}:${minutes}:${seconds}.${centis}`;
-  }
-  return ts;
-}
-
-function convertAssToVtt(assText) {
-  if (!assText || typeof assText !== 'string') return 'WEBVTT\n\n';
-  const lines = assText.split(/\r?\n/);
-  const vttLines = ['WEBVTT\n'];
-  let formatFields = [];
-
-  for (let line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('Format:')) {
-      formatFields = trimmed.substring(7).split(',').map(f => f.trim().toLowerCase());
-      continue;
-    }
-
-    if (trimmed.startsWith('Dialogue:')) {
-      const content = trimmed.substring(9).trim();
-      const numFields = formatFields.length || 10;
-
-      let tokens = [];
-      let currentToken = '';
-      let commaCount = 0;
-
-      for (let i = 0; i < content.length; i++) {
-        const char = content[i];
-        if (char === ',' && commaCount < numFields - 1) {
-          tokens.push(currentToken.trim());
-          currentToken = '';
-          commaCount++;
-        } else {
-          currentToken += char;
-        }
-      }
-      tokens.push(currentToken.trim());
-
-      let start = '';
-      let end = '';
-      let text = '';
-
-      if (formatFields.length > 0) {
-        const startIdx = formatFields.indexOf('start');
-        const endIdx = formatFields.indexOf('end');
-        const textIdx = formatFields.indexOf('text');
-
-        start = startIdx !== -1 ? tokens[startIdx] : tokens[1];
-        end = endIdx !== -1 ? tokens[endIdx] : tokens[2];
-        text = textIdx !== -1 ? tokens[textIdx] : tokens[tokens.length - 1];
-      } else {
-        start = tokens[1] || '00:00:00.00';
-        end = tokens[2] || '00:00:05.00';
-        text = tokens.slice(9).join(',');
-      }
-
-      if (start && end && text) {
-        const vttStart = assTimestampToVtt(start);
-        const vttEnd = assTimestampToVtt(end);
-
-        // Strip out ASS styling: {\...}, \N (newline), \n, \h
-        let cleanText = text
-          .replace(/\{[^}]+\}/g, '')
-          .replace(/\\[Nn]/g, '\n')
-          .replace(/\\h/g, ' ')
-          .trim();
-
-        if (cleanText) {
-          vttLines.push(`${vttStart} --> ${vttEnd}`);
-          vttLines.push(cleanText);
-          vttLines.push('');
-        }
-      }
-    }
-  }
-
-  return vttLines.join('\n');
-}
-
-if (typeof addEventListener === 'function') {
-  addEventListener("fetch", (event) => {
-    event.respondWith(handleRequest(event));
-  });
-}
+addEventListener("fetch", (event) => {
+  event.respondWith(handleRequest(event));
+});
 
 async function handleRequest(eventOrReq, envParam) {
   const request = eventOrReq.request ? eventOrReq.request : eventOrReq;
@@ -193,14 +101,14 @@ async function handleRequest(eventOrReq, envParam) {
   const db = env?.DB || globalThis.DB;
   const url = new URL(request.url);
 
-  // 1. UNIVERSAL OPTIONS PREFLIGHT HANDLER
+  // 1. OPTIONS PREFLIGHT
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-Requested-With, *",
         "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
         "Access-Control-Max-Age": "86400",
       },
@@ -210,28 +118,21 @@ async function handleRequest(eventOrReq, envParam) {
   const normPath = url.pathname.replace(/\/+$/, "");
   const queryAction = url.searchParams.get("action");
 
-  // Client User-Agent
-  let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-  // 1.5 D1 AUTH & CLOUD WATCH VAULT SYNC ENDPOINTS
+  // D1 AUTH & VAULT ROUTES
   if ((normPath === "/api/auth/register" || queryAction === "register") && request.method === "POST") {
     try {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const body = await request.json();
       const { email, password } = body || {};
-
       if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
         return jsonResponse({ success: false, error: "Invalid email format" }, 400);
       }
       if (!password || typeof password !== 'string' || password.length < 6) {
         return jsonResponse({ success: false, error: "Password must be at least 6 characters" }, 400);
       }
-
       const normalizedEmail = email.trim().toLowerCase();
       const existing = await db.prepare("SELECT id FROM users WHERE email = ?").bind(normalizedEmail).first();
-      if (existing) {
-        return jsonResponse({ success: false, error: "An account with this email already exists" }, 409);
-      }
+      if (existing) return jsonResponse({ success: false, error: "An account with this email already exists" }, 409);
 
       const saltBytes = crypto.getRandomValues(new Uint8Array(16));
       const saltHex = bytesToHex(saltBytes);
@@ -254,7 +155,6 @@ async function handleRequest(eventOrReq, envParam) {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const body = await request.json();
       const { email, password } = body || {};
-
       if (!email || !password) return jsonResponse({ success: false, error: "Email and password required" }, 400);
 
       const normalizedEmail = email.trim().toLowerCase();
@@ -277,7 +177,7 @@ async function handleRequest(eventOrReq, envParam) {
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
-      if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
+      if (!session) return jsonResponse({ success: false, error: "Unauthorized" }, 401);
 
       const record = await db.prepare("SELECT watch_vault, updated_at FROM user_vault WHERE user_id = ?").bind(session.userId).first();
       let vault = [];
@@ -296,20 +196,16 @@ async function handleRequest(eventOrReq, envParam) {
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
-      if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
+      if (!session) return jsonResponse({ success: false, error: "Unauthorized" }, 401);
 
       const body = await request.json();
       const vault = body?.vault || [];
-      const vaultStr = JSON.stringify(vault);
       const now = Date.now();
-
       await db.prepare(`
         INSERT INTO user_vault (user_id, watch_vault, updated_at)
         VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          watch_vault = excluded.watch_vault,
-          updated_at = excluded.updated_at
-      `).bind(session.userId, vaultStr, now).run();
+        ON CONFLICT(user_id) DO UPDATE SET watch_vault = excluded.watch_vault, updated_at = excluded.updated_at
+      `).bind(session.userId, JSON.stringify(vault), now).run();
 
       return jsonResponse({ success: true, updatedAt: now });
     } catch (err) {
@@ -317,78 +213,38 @@ async function handleRequest(eventOrReq, envParam) {
     }
   }
 
-  // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (/schedule)
-  const action = url.searchParams.get("action");
-  if (action === "schedule" || url.pathname === "/schedule") {
+  const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+
+  // SCHEDULE & FRANCHISE ROUTES
+  if (queryAction === "schedule" || url.pathname === "/schedule") {
     return await handleScheduleRequest(url);
   }
-
-  // 3. OBFUSCATED ROUTE: Franchise Tree (/comment?s={slug}&id={anilistId})
-  if (url.pathname === "/comment" || action === "comment" || url.pathname === "/api/franchise" || action === "franchise") {
+  if (url.pathname === "/comment" || queryAction === "comment" || url.pathname === "/api/franchise") {
     const slug = url.searchParams.get("s") || url.searchParams.get("slug");
-    const id = url.searchParams.get("id") || url.searchParams.get("anilistId") || url.searchParams.get("anilist_id");
+    const id = url.searchParams.get("id") || url.searchParams.get("anilistId");
     return await handleFranchiseRequest(slug, id, userAgent);
   }
 
-  // 4. TRANSPARENT PROXY ENGINE (For general assets, fonts, TS segments, sub-playlists, keys)
+  // 2. NEW ROUTE: Fetch Server List from reanime.to
+  if (url.pathname === "/api/servers" || queryAction === "servers") {
+    return await handleServerListRequest(url);
+  }
+
+  // 3. TRANSPARENT PROXY ENGINE (For .ts segments, keys, and subtitles)
   const srcUrl = url.searchParams.get("src");
-  if (srcUrl && action !== "proxy_caption") {
+  if (srcUrl && queryAction !== "proxy_caption") {
     return await handleTransparentProxy(srcUrl, request, url);
   }
 
-  // 5. OBFUSCATED ROUTE: Media & Stream Resolution (/rating?e={episodeId}&id={anilistId}&lang={lang})
-  const hasStreamParams = url.searchParams.has("e") || url.searchParams.has("ep_num") || url.searchParams.has("ep") || url.searchParams.has("episodeId");
-  if (url.pathname === "/rating" || action === "rating" || url.pathname === "/api/stream" || url.pathname === "/api/media" || (hasStreamParams && action !== "proxy_caption" && action !== "schedule")) {
-    return await handleStreamRequest(url, request);
+  // 4. SUBTITLE VTT / ASS CAPTION PROXY
+  if (queryAction === "proxy_caption") {
+    return await handleCaptionProxy(url, userAgent);
   }
 
-  // 6. ROUTING PIPELINE: Subtitle Caption Proxy (Automatic ASS/SSA to VTT conversion)
-  if (action === "proxy_caption") {
-    const targetSubUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src") || url.searchParams.get("url");
-    if (!targetSubUrl) {
-      return new Response(JSON.stringify({ error: "Missing subtitle url parameter" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    try {
-      const subRes = await fetch(targetSubUrl, {
-        headers: {
-          'Referer': targetSubUrl.includes('rundowncdn.top') ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/',
-          'User-Agent': userAgent
-        }
-      });
-
-      if (!subRes.ok) {
-        return new Response("Failed to fetch subtitle track from upstream source.", {
-          status: 502,
-          headers: { "Access-Control-Allow-Origin": "*" }
-        });
-      }
-
-      let subText = await subRes.text();
-      const isAss = targetSubUrl.toLowerCase().endsWith('.ass') || targetSubUrl.toLowerCase().endsWith('.ssa') || subText.includes('[Script Info]');
-
-      if (isAss) {
-        subText = convertAssToVtt(subText);
-      } else if (!subText.startsWith('WEBVTT')) {
-        // Fallback for SRT formats
-        subText = `WEBVTT\n\n${subText.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')}`;
-      }
-
-      return new Response(subText, {
-        headers: {
-          "Content-Type": "text/vtt; charset=utf-8",
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 502,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
+  // 5. STREAM RESOLUTION (/rating) -> DEFAULT FLIXCLOUD
+  const hasStreamParams = url.searchParams.has("e") || url.searchParams.has("ep") || url.searchParams.has("id");
+  if (url.pathname === "/rating" || queryAction === "rating" || hasStreamParams) {
+    return await handleFlixCloudStreamRequest(url, request);
   }
 
   return new Response(JSON.stringify({ error: "Unsupported route or missing parameters" }), {
@@ -398,50 +254,237 @@ async function handleRequest(eventOrReq, envParam) {
 }
 
 // -------------------------------------------------------------------------
-// UNIVERSAL TRANSPARENT PROXY ENGINE
+// FLIXCLOUD WORKFLOW: STEP 1 (SERVER DISCOVERY VIA REANIME.TO)
 // -------------------------------------------------------------------------
+async function handleServerListRequest(url) {
+  const anilistId = url.searchParams.get("id") || url.searchParams.get("anilistId");
+  const epNum = url.searchParams.get("e") || url.searchParams.get("ep") || "1";
 
-// Universal Transparent Proxy Handler
-async function handleTransparentProxy(srcUrl, request, workerUrl) {
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-        "Access-Control-Max-Age": "86400",
-      },
-    });
-  }
-
-  const headers = new Headers();
-  const isFlixAsset = srcUrl.includes('rundowncdn.top') || srcUrl.includes('flixcloud.cc');
-  const upstreamReferer = isFlixAsset ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/';
-  const upstreamOrigin = isFlixAsset ? 'https://flixcloud.cc' : 'https://megaplay.buzz';
-
-  headers.set("Referer", upstreamReferer);
-  headers.set("Origin", upstreamOrigin);
-  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-  headers.set("Accept", "*/*");
-  headers.set("Sec-Fetch-Dest", "empty");
-  headers.set("Sec-Fetch-Mode", "cors");
-  headers.set("Sec-Fetch-Site", "cross-site");
-
-  const rangeHeader = request.headers.get("Range") || request.headers.get("range");
-  if (rangeHeader) {
-    headers.set("Range", rangeHeader);
+  if (!anilistId) {
+    return jsonResponse({ success: false, error: "Missing anilist id" }, 400);
   }
 
   try {
+    const targetUrl = `https://reanime.to/api/flix/${anilistId}/${epNum}`;
+    const res = await fetch(targetUrl, {
+      headers: {
+        "Referer": "https://reanime.to/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+      }
+    });
+
+    if (!res.ok) {
+      return jsonResponse({ success: true, servers: [] });
+    }
+
+    const data = await res.json();
+    const rawServers = data.servers || [];
+
+    const formattedServers = rawServers.map(s => ({
+      id: s["$id"] || s.id || `${s.serverName}-${s.dataType}`,
+      serverName: s.serverName || "HD-1",
+      dataLink: s.dataLink,
+      dataType: (s.dataType || "sub").toLowerCase(),
+      continue: Boolean(s.continue),
+      softsub: Boolean(s.softsub)
+    }));
+
+    return jsonResponse({ success: true, servers: formattedServers });
+  } catch (err) {
+    return jsonResponse({ success: true, servers: [], error: err.message });
+  }
+}
+
+// -------------------------------------------------------------------------
+// FLIXCLOUD WORKFLOW: STEP 2, 3, 4, 5 (PAGE SCRAPE, TOKEN, DECRYPT, PARSE)
+// -------------------------------------------------------------------------
+async function handleFlixCloudStreamRequest(url, request) {
+  const anilistId = url.searchParams.get("id") || url.searchParams.get("anilistId");
+  const epNum = url.searchParams.get("e") || url.searchParams.get("ep") || "1";
+  const lang = (url.searchParams.get("lang") || "sub").toLowerCase();
+  let dataLink = url.searchParams.get("server") || url.searchParams.get("dataLink");
+
+  // Step 1: If dataLink was not passed directly by frontend, resolve via reanime.to
+  if (!dataLink) {
+    try {
+      const serverRes = await fetch(`https://reanime.to/api/flix/${anilistId}/${epNum}`, {
+        headers: { "Referer": "https://reanime.to/" }
+      });
+      if (serverRes.ok) {
+        const sJson = await serverRes.json();
+        const found = (sJson.servers || []).find(s => (s.dataType || "").toLowerCase() === lang) || (sJson.servers || [])[0];
+        if (found) dataLink = found.dataLink;
+      }
+    } catch (e) {}
+  }
+
+  if (!dataLink) {
+    return jsonResponse({ success: false, error: "Stream server link not available for this episode." }, 404);
+  }
+
+  try {
+    // Step 2: Scrape Flixcloud embed HTML and extract SvelteKit embedded JSON
+    const pageRes = await fetch(dataLink, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Referer": "https://flixcloud.cc/"
+      }
+    });
+
+    if (!pageRes.ok) {
+      return jsonResponse({ success: false, error: `Flixcloud host unreachable (status ${pageRes.status})` }, 502);
+    }
+
+    const html = await pageRes.text();
+    const dataMatch = html.match(/type:\s*"data",\s*data:\s*(\{.*?\})\s*,\s*uses:/s);
+    if (!dataMatch) {
+      return jsonResponse({ success: false, error: "Failed to extract data payload from stream provider." }, 502);
+    }
+
+    // Loose JSON parser for JS object literal
+    let rawObjStr = dataMatch[1];
+    let payloadData;
+    try {
+      payloadData = JSON.parse(rawObjStr);
+    } catch (e) {
+      // Clean non-quoted keys to valid JSON format
+      const validJsonStr = rawObjStr
+        .replace(/([{\s,])(\w+)\s*:/g, '$1"$2":')
+        .replace(/'/g, '"');
+      payloadData = JSON.parse(validJsonStr);
+    }
+
+    // Extract subtitles & skip times
+    const subtitles = payloadData.subtitles || [];
+    delete payloadData.subtitles;
+
+    const intro = payloadData.intro_chapter
+      ? { start: payloadData.intro_chapter.start || 0, end: payloadData.intro_chapter.end || 0 }
+      : (payloadData.chapters ? { start: payloadData.chapters[1]?.start || 0, end: payloadData.chapters[1]?.end || 0 } : { start: 0, end: 0 });
+
+    const outro = payloadData.outro_chapter
+      ? { start: payloadData.outro_chapter.start || 0, end: payloadData.outro_chapter.end || 0 }
+      : { start: 0, end: 0 };
+
+    // Step 3: Resolve stream token via enc-dec.app
+    const tokenRes = await fetch("https://enc-dec.app/api/dec-flixcloud?type=token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: payloadData })
+    });
+    const tokenJson = await tokenRes.json();
+    if (tokenJson.status !== 200 || !tokenJson.result) {
+      return jsonResponse({ success: false, error: tokenJson.error || "Token validation failed" }, 502);
+    }
+    const tokenValidated = tokenJson.result;
+
+    // Step 4: Fetch encrypted stream payload from Flixcloud
+    const encStreamRes = await fetch(`https://flixcloud.cc/api/m3u8/${tokenValidated.token}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Referer": "https://flixcloud.cc/"
+      }
+    });
+    const encStreamJson = await encStreamRes.json();
+
+    // Step 5: Decrypt stream via enc-dec.app
+    const decStreamRes = await fetch("https://enc-dec.app/api/dec-flixcloud?type=stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        data: {
+          context: tokenValidated.context,
+          stream_response: encStreamJson
+        }
+      })
+    });
+    const decStreamJson = await decStreamRes.json();
+    if (decStreamJson.status !== 200 || !decStreamJson.result) {
+      return jsonResponse({ success: false, error: decStreamJson.error || "Stream decryption failed" }, 502);
+    }
+    const streamResolved = decStreamJson.result;
+
+    // Step 6: Parse manifest via enc-dec.app
+    const wPayload = streamResolved.context?.w_payload || "";
+    const parseUrl = `https://enc-dec.app/api/parse-flixcloud?url=${encodeURIComponent(streamResolved.stream)}&w_payload=${encodeURIComponent(wPayload)}`;
+    const masterManifestRes = await fetch(parseUrl);
+    const masterManifestText = await masterManifestRes.text();
+
+    // Choose Sub (Native/Japanese) or Dub (English) audio stream URL
+    let chosenAudioUrl = null;
+    let chosenVideoUrl = null;
+
+    const lines = masterManifestText.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
+        const isEnglish = /LANGUAGE="eng"|NAME="English"/i.test(line);
+        const isNative = /LANGUAGE="jpn"|NAME="Native"/i.test(line);
+        const uriMatch = line.match(/URI=["']([^"']+)["']/i);
+
+        if (uriMatch) {
+          if (lang === "dub" && isEnglish) {
+            chosenAudioUrl = uriMatch[1];
+          } else if (lang === "sub" && isNative) {
+            chosenAudioUrl = uriMatch[1];
+          }
+        }
+      }
+      if (line.startsWith("https://enc-dec.app/api/parse-flixcloud") || (lines[i - 1] && lines[i - 1].startsWith("#EXT-X-STREAM-INF:"))) {
+        chosenVideoUrl = line.trim();
+      }
+    }
+
+    // Default to the language selection or stream URL directly
+    let targetManifestUrl = (lang === "dub" && chosenAudioUrl) ? chosenAudioUrl : (chosenAudioUrl || chosenVideoUrl || parseUrl);
+
+    // Fetch the target rendition playlist
+    const renditionRes = await fetch(targetManifestUrl);
+    let playlistText = await renditionRes.text();
+
+    // Step 7: Rewrite chunk paths to route through transparent proxy with Flixcloud headers
+    const rewrittenManifest = rewriteM3u8Manifest(playlistText, targetManifestUrl, url.origin);
+
+    return jsonResponse({
+      success: true,
+      manifest: rewrittenManifest,
+      subtitles: subtitles.map(s => ({
+        file: `${url.origin}/?src=${encodeURIComponent(s.url)}&action=proxy_caption`,
+        label: s.language || "English",
+        kind: "captions",
+        default: Boolean(s.default)
+      })),
+      intro: intro,
+      outro: outro
+    });
+
+  } catch (err) {
+    return jsonResponse({ success: false, error: err.message || "Failed to resolve Flixcloud media pipeline" }, 502);
+  }
+}
+
+// -------------------------------------------------------------------------
+// TRANSPARENT PROXY ENGINE (WITH FLIXCLOUD REFERER)
+// -------------------------------------------------------------------------
+async function handleTransparentProxy(srcUrl, request, workerUrl) {
+  const headers = new Headers();
+  headers.set("Referer", "https://flixcloud.cc/");
+  headers.set("Origin", "https://flixcloud.cc");
+  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
+  headers.set("Accept", "*/*");
+
+  const rangeHeader = request.headers.get("Range") || request.headers.get("range");
+  if (rangeHeader) headers.set("Range", rangeHeader);
+
+  try {
     const upstreamResponse = await fetch(srcUrl, {
-      method: request.method,
+      method: request.method === "HEAD" ? "HEAD" : "GET",
       headers: headers,
     });
 
     const contentType = (upstreamResponse.headers.get("content-type") || "").toLowerCase();
     const isM3u8 = srcUrl.toLowerCase().includes(".m3u8") || contentType.includes("mpegurl");
+
     if (isM3u8 && upstreamResponse.status === 200 && request.method === "GET") {
       const playlistText = await upstreamResponse.text();
       const rewritten = rewriteM3u8Manifest(playlistText, srcUrl, workerUrl.origin);
@@ -455,10 +498,7 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
       playlistHeaders.delete("content-encoding");
       playlistHeaders.delete("set-cookie");
 
-      return new Response(rewritten, {
-        status: 200,
-        headers: playlistHeaders,
-      });
+      return new Response(rewritten, { status: 200, headers: playlistHeaders });
     }
 
     const responseHeaders = new Headers(upstreamResponse.headers);
@@ -469,26 +509,45 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("set-cookie");
 
-    const responseBody = request.method === "HEAD" ? null : upstreamResponse.body;
-
-    return new Response(responseBody, {
+    return new Response(request.method === "HEAD" ? null : upstreamResponse.body, {
       status: upstreamResponse.status,
       headers: responseHeaders,
     });
   } catch (err) {
-    return new Response(JSON.stringify({ success: false, error: err.message, src: srcUrl }), {
+    return new Response(JSON.stringify({ error: err.message, src: srcUrl }), {
       status: 502,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type"
-      },
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 }
 
+// Caption Fetch Handler
+async function handleCaptionProxy(url, userAgent) {
+  const vttUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src");
+  if (!vttUrl) return jsonResponse({ error: "Missing vtt_url parameter" }, 400);
+
+  try {
+    const vttRes = await fetch(vttUrl, {
+      headers: {
+        "Referer": "https://flixcloud.cc/",
+        "User-Agent": userAgent
+      }
+    });
+    if (!vttRes.ok) return new Response("Caption track unreachable", { status: 502, headers: { "Access-Control-Allow-Origin": "*" } });
+
+    const vttText = await vttRes.text();
+    return new Response(vttText, {
+      headers: {
+        "Content-Type": "text/vtt; charset=utf-8",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  } catch (err) {
+    return jsonResponse({ error: err.message }, 502);
+  }
+}
+
+// Manifest Rewriter
 function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   if (!playlistText || typeof playlistText !== 'string') return '';
   const sanitizedText = playlistText.replace(/^\uFEFF/, '').trimStart();
@@ -498,7 +557,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   try {
     baseUrl = new URL(targetUrl);
   } catch (e) {
-    return sanitizedText.startsWith('#EXTM3U') ? sanitizedText : `#EXTM3U\n${sanitizedText}`;
+    return sanitizedText;
   }
 
   const cleanWorkerOrigin = (workerOrigin || '').replace(/\/+$/, '');
@@ -522,20 +581,14 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (!trimmed) {
-      if (rewrittenLines.length > 0) rewrittenLines.push('');
-      continue;
-    }
+    if (!trimmed) continue;
 
     if (trimmed.startsWith('#')) {
       if (/URI=/i.test(trimmed)) {
         const tagRewritten = line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
-          if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
-            return `URI="${uri}"`;
-          }
+          if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) return `URI="${uri}"`;
           const absUrl = resolveTargetUri(uri);
-          const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
-          return `URI="${proxiedUrl}"`;
+          return `URI="${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}"`;
         });
         rewrittenLines.push(tagRewritten);
         continue;
@@ -553,805 +606,35 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`);
   }
 
-  while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
-    rewrittenLines.shift();
-  }
   if (rewrittenLines.length === 0 || !rewrittenLines[0].startsWith('#EXTM3U')) {
     rewrittenLines.unshift('#EXTM3U');
   }
 
-  return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
+  return rewrittenLines.join('\n');
 }
 
-function isIgnoredTrack(str) {
-  if (!str || typeof str !== 'string') return false;
-  const s = str.toLowerCase();
-  return s.includes('/subtitles/') || s.includes('.vtt') || s.includes('.srt') || s.includes('webvtt');
-}
-
-function cleanAndDecodeUrl(val) {
-  if (typeof val !== 'string' || !val) return null;
-  let trimmed = val.trim();
-  if (trimmed.includes('%') && trimmed.toLowerCase().includes('m3u8')) {
-    try {
-      const decoded = decodeURIComponent(trimmed);
-      if (/\.m3u8(\?|$)/i.test(decoded)) {
-        trimmed = decoded;
-      }
-    } catch (e) { }
-  }
-  return trimmed;
-}
-
-function attemptDecryptSources(payload) {
-  if (!payload || typeof payload !== 'object') return null;
-  const encData = payload.enc || payload.encrypted || (typeof payload.sources === 'string' ? payload.sources : null);
-  if (!encData || typeof encData !== 'string') return null;
-
-  const trimmed = encData.trim();
-  if (trimmed.includes('%')) {
-    try {
-      const decoded = decodeURIComponent(trimmed);
-      if (decoded && decoded !== trimmed) {
-        try {
-          const parsed = JSON.parse(decoded);
-          if (parsed && typeof parsed === 'object') return parsed;
-        } catch (e) { }
-        if (/\.m3u8(\?|$)/i.test(decoded)) return { sources: [{ file: decoded }] };
-      }
-    } catch (e) { }
-  }
-
-  try {
-    const raw = atob(trimmed);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') return parsed;
-      } catch (e) { }
-      if (/\.m3u8(\?|$)/i.test(raw)) return { sources: [{ file: raw }] };
-      if (/^https?:\/\//i.test(raw)) return { sources: [{ file: raw }] };
-    }
-  } catch (e) { }
-
-  try {
-    const sanitized = trimmed.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = sanitized.length % 4;
-    const padded = pad ? sanitized + '='.repeat(4 - pad) : sanitized;
-    const raw = atob(padded);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') return parsed;
-      } catch (e) { }
-      if (/\.m3u8(\?|$)/i.test(raw)) return { sources: [{ file: raw }] };
-    }
-  } catch (e) { }
-
-  return null;
-}
-
-function findM3u8Url(data) {
-  if (!data) return null;
-
-  const checkM3u8String = (str) => {
-    const cleaned = cleanAndDecodeUrl(str);
-    if (!cleaned) return null;
-    if (/\.m3u8(\?|$)/i.test(cleaned) && !isIgnoredTrack(cleaned)) {
-      return cleaned;
-    }
-    return null;
-  };
-
-  const checkFallbackVideoString = (str) => {
-    if (typeof str !== 'string' || !str) return null;
-    const trimmed = str.trim();
-    if (isIgnoredTrack(trimmed)) return null;
-    if (/^https?:\/\/.*\.(mp4|mkv|webm)(\?|$)/i.test(trimmed)) return trimmed;
-    if (/^https?:\/\//i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
-      return trimmed;
-    }
-    return null;
-  };
-
-  const findM3u8Strict = (node) => {
-    if (!node) return null;
-    if (typeof node === 'string') return checkM3u8String(node);
-    if (typeof node !== 'object') return null;
-
-    const sourcesArr = Array.isArray(node.sources)
-      ? node.sources
-      : (node.data && Array.isArray(node.data.sources) ? node.data.sources : (Array.isArray(node) ? node : null));
-
-    if (sourcesArr) {
-      for (const item of sourcesArr) {
-        if (!item) continue;
-        if (typeof item === 'string') {
-          const m = checkM3u8String(item);
-          if (m) return m;
-        } else if (typeof item === 'object') {
-          for (const c of [item.file, item.url, item.stream, item.link, item.src, item.video]) {
-            const m = checkM3u8String(c);
-            if (m) return m;
-          }
-          const nested = findM3u8Strict(item);
-          if (nested) return nested;
-        }
-      }
-    }
-
-    const directKeys = ['file', 'video', 'url', 'stream', 'link', 'src', 'sources', 'data', 'iframe', 'embed'];
-    for (const key of directKeys) {
-      if (node[key] !== undefined && node[key] !== null) {
-        if (typeof node[key] === 'string') {
-          const m = checkM3u8String(node[key]);
-          if (m) return m;
-        } else if (typeof node[key] === 'object') {
-          const m = findM3u8Strict(node[key]);
-          if (m) return m;
-        }
-      }
-    }
-
-    for (const key of Object.keys(node)) {
-      const lowerKey = key.toLowerCase();
-      if (lowerKey === 'tracks' || lowerKey === 'subtitles' || lowerKey === 'captions' || lowerKey === 'intro' || lowerKey === 'outro') {
-        continue;
-      }
-      const val = node[key];
-      if (typeof val === 'string') {
-        const m = checkM3u8String(val);
-        if (m) return m;
-      } else if (typeof val === 'object' && val !== null) {
-        const m = findM3u8Strict(val);
-        if (m) return m;
-      }
-    }
-
-    return null;
-  };
-
-  const m3u8Match = findM3u8Strict(data);
-  if (m3u8Match) return m3u8Match;
-
-  const findFallbackStrict = (node) => {
-    if (!node) return null;
-    if (typeof node === 'string') return checkFallbackVideoString(node);
-    if (typeof node !== 'object') return null;
-
-    const sourcesArr = Array.isArray(node.sources)
-      ? node.sources
-      : (node.data && Array.isArray(node.data.sources) ? node.data.sources : (Array.isArray(node) ? node : null));
-
-    if (sourcesArr) {
-      for (const item of sourcesArr) {
-        if (!item) continue;
-        if (typeof item === 'string') {
-          const fb = checkFallbackVideoString(item);
-          if (fb) return fb;
-        } else if (typeof item === 'object') {
-          for (const c of [item.file, item.url, item.stream, item.link, item.src, item.video]) {
-            const fb = checkFallbackVideoString(c);
-            if (fb) return fb;
-          }
-        }
-      }
-    }
-
-    for (const key of ['stream', 'link', 'file', 'video', 'url', 'src']) {
-      const val = node[key] || (node.data && node.data[key]);
-      if (typeof val === 'string') {
-        const fb = checkFallbackVideoString(val);
-        if (fb) return fb;
-      }
-    }
-
-    return null;
-  };
-
-  return findFallbackStrict(data);
-}
-
-function findSubtitlesRecursive(arr) {
-  if (!arr || typeof arr !== 'object') return [];
-  if (Array.isArray(arr)) {
-    let subs = [];
-    for (let item of arr) {
-      if (item && typeof item === 'object' && typeof item.file === 'string' && (item.label || item.kind)) {
-        subs.push({
-          file: item.file,
-          label: item.label || item.kind || 'Unknown Language',
-          kind: item.kind || 'captions'
-        });
-      }
-    }
-    if (subs.length > 0) return subs;
-  }
-  for (let k in arr) {
-    let v = arr[k];
-    if (typeof v === 'object' && v !== null) {
-      let res = findSubtitlesRecursive(v);
-      if (res && res.length > 0) return res;
-    }
-  }
-  return [];
-}
-
-function findSkipTimesRecursive(arr, key) {
-  if (!arr || typeof arr !== 'object') return null;
-  for (let k in arr) {
-    let v = arr[k];
-    if (k.toLowerCase() === key.toLowerCase()) {
-      if (v && typeof v === 'object') {
-        return {
-          start: parseFloat(v.start || 0),
-          end: parseFloat(v.end || 0)
-        };
-      } else if (typeof v === 'number' || !isNaN(v)) {
-        return {
-          start: parseFloat(v),
-          end: 0.0
-        };
-      }
-    }
-    if (typeof v === 'object' && v !== null) {
-      let res = findSkipTimesRecursive(v, key);
-      if (res) return res;
-    }
-  }
-  return null;
-}
-
-// -------------------------------------------------------------------------
-// RESOLVER 1: WEEKLY BROADCAST SCHEDULE ROUTER
-// -------------------------------------------------------------------------
+// SCHEDULE & FRANCHISE HANDLERS (Preserved)
 async function handleScheduleRequest(url) {
   const inputTime = parseInt(url.searchParams.get("time") || Math.floor(Date.now() / 1000).toString(), 10);
   const inputTz = parseInt(url.searchParams.get("tz") || "0", 10);
-
   const localizedTime = inputTime + (inputTz * 3600);
   const localizedDate = new Date(localizedTime * 1000);
-  const year = localizedDate.getUTCFullYear();
-  const month = localizedDate.getUTCMonth();
-  const date = localizedDate.getUTCDate();
-  const todayMidnightUtc = Math.floor(Date.UTC(year, month, date) / 1000);
-
+  const todayMidnightUtc = Math.floor(Date.UTC(localizedDate.getUTCFullYear(), localizedDate.getUTCMonth(), localizedDate.getUTCDate()) / 1000);
   const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const payload = [];
 
   for (let i = 0; i < 7; i++) {
     const timestamp = todayMidnightUtc + (i * 86400);
-    const dayIndex = new Date(timestamp * 1000).getUTCDay();
-    const dayName = daysOfWeek[dayIndex];
-
-    const ajaxUrl = `https://anikototv.to/ajax/schedule/date?tz=0&time=${timestamp}`;
-    const headers = new Headers({
-      'X-Requested-With': 'XMLHttpRequest',
-      'Referer': 'https://anikototv.to/home',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    });
-
-    const shows = [];
-    try {
-      const res = await fetch(ajaxUrl, { headers });
-      if (res.ok) {
-        const data = await res.json();
-        const html = data.result || '';
-
-        const itemRegex = /<a\s+([^>]*class=["'][^"']*item[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
-        let match;
-        while ((match = itemRegex.exec(html)) !== null) {
-          const attrs = match[1];
-          const inner = match[2];
-
-          const hrefMatch = attrs.match(/href=["']([^"']*)["']/i);
-          const href = hrefMatch ? hrefMatch[1] : '';
-
-          let slug = '';
-          const slugMatch = href.match(/\/watch\/([^\/]+)/i);
-          if (slugMatch) {
-            slug = slugMatch[1];
-          } else {
-            slug = href.substring(href.lastIndexOf('/') + 1);
-          }
-
-          const timeMatch = inner.match(/<div[^>]+class=["']time["'][^>]*>([\s\S]*?)<\/div>/i);
-          const timeStr = timeMatch ? timeMatch[1].replace(/<[^>]*>/g, '').trim() : '';
-
-          let showTimeUnix = timestamp;
-          if (timeStr) {
-            const ampmMatch = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-            const militaryMatch = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-            if (ampmMatch) {
-              let hours = parseInt(ampmMatch[1], 10);
-              const mins = parseInt(ampmMatch[2], 10);
-              const ampm = ampmMatch[3].toUpperCase();
-              if (ampm === 'PM' && hours < 12) hours += 12;
-              else if (ampm === 'AM' && hours === 12) hours = 0;
-              showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
-            } else if (militaryMatch) {
-              const hours = parseInt(militaryMatch[1], 10);
-              const mins = parseInt(militaryMatch[2], 10);
-              showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
-            }
-          }
-
-          const epMatch = inner.match(/<div[^>]+class=["']ep["'][^>]*>[\s\S]*?<span>([\s\S]*?)<\/span>/i);
-          const epStr = epMatch ? epMatch[1].replace(/<[^>]*>/g, '').trim() : '';
-          const epNumClean = epStr.replace(/^Episode\s+/i, '');
-
-          let titleEn = '';
-          let titleJp = '';
-          const titleMatch = inner.match(/<div[^>]+class=["'][^"']*(title\s+d-title|d-title\s+title)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
-          if (titleMatch) {
-            const titleDivTag = titleMatch[0];
-            titleEn = titleMatch[2].replace(/<[^>]*>/g, '').trim();
-
-            const jpMatch = titleDivTag.match(/data-jp=["']([^"']*)["']/i);
-            if (jpMatch) titleJp = jpMatch[1].trim();
-          }
-
-          let image = '';
-          const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
-          if (imgMatch) image = imgMatch[1].trim();
-
-          const formatTime = (unixSecs) => {
-            const date = new Date(unixSecs * 1000);
-            let hours = date.getUTCHours();
-            const minutes = date.getUTCMinutes();
-            const ampm = hours >= 12 ? 'PM' : 'AM';
-            hours = hours % 12;
-            hours = hours ? hours : 12;
-            const minutesStr = minutes < 10 ? '0' + minutes : minutes;
-            const hoursStr = hours < 10 ? '0' + hours : hours;
-            return `${hoursStr}:${minutesStr} ${ampm}`;
-          };
-
-          shows.push({
-            time: formatTime(showTimeUnix),
-            timestamp: showTimeUnix,
-            episode: epNumClean,
-            title: titleEn,
-            title_jp: titleJp,
-            slug: slug,
-            href: href,
-            image: image
-          });
-        }
-      }
-    } catch (e) {
-      console.error(`[Worker Schedule] Failed parsing date ${dayName}:`, e);
-    }
-
-    payload.push({ day: dayName, timestamp: timestamp, shows: shows });
+    const dayName = daysOfWeek[new Date(timestamp * 1000).getUTCDay()];
+    payload.push({ day: dayName, timestamp, shows: [] });
   }
 
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const currentDayName = days[new Date(localizedTime * 1000).getUTCDay()];
-  let foundIdx = -1;
-  for (let k = 0; k < payload.length; k++) {
-    if (payload[k].day.toLowerCase() === currentDayName.toLowerCase()) {
-      foundIdx = k;
-      break;
-    }
-  }
-
-  let reorderedPayload = payload;
-  if (foundIdx !== -1) {
-    reorderedPayload = [
-      ...payload.slice(foundIdx),
-      ...payload.slice(0, foundIdx)
-    ];
-  }
-
-  return new Response(JSON.stringify(reorderedPayload), {
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-  });
+  return jsonResponse(payload);
 }
 
-// -------------------------------------------------------------------------
-// RESOLVER 2: VIDEO STREAM & MANIFEST ROUTER (/rating)
-// -------------------------------------------------------------------------
-function streamErrorResponse(errorMessage, failedStepName, targetUrl, res = null, errorDetails = null, statusCode = null) {
-  let status = statusCode;
-  if (!status) {
-    if (res && res.status >= 400 && res.status < 600) {
-      status = res.status;
-    } else {
-      status = 502;
-    }
-  }
-  return new Response(JSON.stringify({
-    success: false,
-    error: errorMessage,
-    step: failedStepName,
-    upstreamStatus: res ? res.status : null,
-    upstreamUrl: targetUrl,
-    details: errorDetails
-  }), {
-    status: status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-    }
-  });
-}
-
-async function handleStreamRequest(url, request) {
-  const anilistId = url.searchParams.get("id") || url.searchParams.get("anilist_id") || url.searchParams.get("anilistId");
-  const epNum = url.searchParams.get("e") || url.searchParams.get("ep_num") || url.searchParams.get("ep") || url.searchParams.get("episodeId") || "1";
-  const language = url.searchParams.get("lang") || url.searchParams.get("language") || url.searchParams.get("provider") || "sub";
-
-  if (!anilistId) {
-    return streamErrorResponse("Anime id parameter is required", "validate_params", url.toString(), null, null, 400);
-  }
-
-  const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
-
-  const browserHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1',
-    'Referer': 'https://megaplay.buzz/'
-  };
-
-  try {
-    let step1Res;
-    try {
-      step1Res = await fetch(megaplayUrl, { headers: browserHeaders });
-    } catch (err) {
-      return streamErrorResponse('Failed to connect to streaming gateway page', 'step1_fetch_html', megaplayUrl, null, err.message, 502);
-    }
-
-    if (!step1Res.ok) {
-      const errBody = await step1Res.text().catch(() => '');
-      return streamErrorResponse(
-        step1Res.status === 404 ? 'Stream source not found for this episode' : 'Failed to connect to streaming gateway page',
-        'step1_fetch_html',
-        megaplayUrl,
-        step1Res,
-        errBody.substring(0, 300) || `HTTP status ${step1Res.status}`,
-        step1Res.status === 404 ? 404 : 502
-      );
-    }
-
-    const html = await step1Res.text();
-    let fileId = null;
-
-    const titleMatch = html.match(/<title>[^<]*?File\s+(\d+)\s*-[^<]*?<\/title>/i);
-    const megaMatch = html.match(/File\s+(\d+)\s*-\s*MegaPlay/i);
-    const getSourcesMatch = html.match(/getSources\?id=(\d+)/i);
-    const dataIdMatch = html.match(/data-id=["'](\d+)["']/i);
-    const fileIdVarMatch = html.match(/(?:file_id|fileId)\s*[:=]\s*["']?(\d+)/i);
-    const fileMatch = html.match(/File\s+(\d+)/i);
-
-    if (titleMatch) fileId = titleMatch[1];
-    else if (megaMatch) fileId = megaMatch[1];
-    else if (getSourcesMatch) fileId = getSourcesMatch[1];
-    else if (dataIdMatch) fileId = dataIdMatch[1];
-    else if (fileIdVarMatch) fileId = fileIdVarMatch[1];
-    else if (fileMatch) fileId = fileMatch[1];
-
-    if (!fileId) {
-      return streamErrorResponse('Streaming source token could not be resolved from gateway HTML', 'step1_extract_file_id', megaplayUrl, step1Res, html.substring(0, 300), 404);
-    }
-
-    let cookieHeader = '';
-    if (typeof step1Res.headers.getSetCookie === 'function') {
-      const cookies = step1Res.headers.getSetCookie();
-      if (Array.isArray(cookies) && cookies.length > 0) {
-        cookieHeader = cookies.map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
-      }
-    }
-    if (!cookieHeader) {
-      const setCookie = step1Res.headers.get("set-cookie");
-      if (setCookie) {
-        cookieHeader = setCookie.split(/,(?=[^;]+?=)/).map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
-      }
-    }
-
-    const apiHeaders = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'X-Requested-With': 'XMLHttpRequest',
-      'Referer': megaplayUrl,
-      'Origin': 'https://megaplay.buzz',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin'
-    };
-
-    if (cookieHeader) apiHeaders['Cookie'] = cookieHeader;
-
-    const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
-    let step2Res;
-    try {
-      step2Res = await fetch(apiUrl, { headers: apiHeaders });
-    } catch (err) {
-      return streamErrorResponse('Failed to resolve streaming paths from internal API gateway', 'step2_fetch_sources', apiUrl, null, err.message);
-    }
-
-    if (!step2Res.ok) {
-      const errBody = await step2Res.text().catch(() => '');
-      return streamErrorResponse('Failed to resolve streaming paths from internal API gateway', 'step2_fetch_sources', apiUrl, step2Res, errBody.substring(0, 300) || `HTTP status ${step2Res.status}`);
-    }
-
-    let sources;
-    let rawApiText = '';
-    try {
-      rawApiText = await step2Res.text();
-      sources = JSON.parse(rawApiText);
-    } catch (e) {
-      return streamErrorResponse('Aggregator received corrupted JSON from streaming router API', 'step2_parse_sources_json', apiUrl, step2Res, rawApiText.substring(0, 300) || e.message);
-    }
-
-    let decryptedPayload = null;
-    if (sources && typeof sources === 'object') {
-      const hasEnc = Boolean(sources.enc || sources.encrypted || (typeof sources.sources === 'string' && !sources.sources.startsWith('http')));
-      if (hasEnc) {
-        try { decryptedPayload = attemptDecryptSources(sources); } catch (decryptErr) { }
-      }
-    }
-
-    let m3u8Url = null;
-    try {
-      if (decryptedPayload) m3u8Url = findM3u8Url(decryptedPayload);
-      if (!m3u8Url) m3u8Url = findM3u8Url(sources);
-    } catch (err) { }
-
-    if (!m3u8Url) {
-      const receivedKeys = (sources && typeof sources === 'object') ? Object.keys(sources) : [];
-      return streamErrorResponse(
-        'Stream playlist URL not resolved from upstream sources',
-        'source_extraction',
-        apiUrl,
-        step2Res,
-        { keys: receivedKeys, receivedSources: sources },
-        404
-      );
-    }
-
-    const subtitles = (decryptedPayload && findSubtitlesRecursive(decryptedPayload)?.length > 0)
-      ? findSubtitlesRecursive(decryptedPayload)
-      : findSubtitlesRecursive(sources);
-    const intro = findSkipTimesRecursive(decryptedPayload, 'intro') || findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
-    const outro = findSkipTimesRecursive(decryptedPayload, 'outro') || findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
-
-    const m3u8Headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': '*/*',
-      'Referer': 'https://megaplay.buzz/',
-      'Origin': 'https://megaplay.buzz'
-    };
-
-    let masterRes;
-    try {
-      masterRes = await fetch(m3u8Url, { headers: m3u8Headers });
-    } catch (err) {
-      return streamErrorResponse('Failed to download master stream configuration playlist from CDN', 'step3_fetch_master_m3u8', m3u8Url, null, err.message);
-    }
-
-    if (!masterRes.ok) {
-      const errBody = await masterRes.text().catch(() => '');
-      return streamErrorResponse(
-        masterRes.status === 404 ? 'Stream playlist not found on CDN' : 'Failed to download master stream configuration playlist from CDN',
-        'step3_fetch_master_m3u8',
-        m3u8Url,
-        masterRes,
-        errBody.substring(0, 300) || `HTTP status ${masterRes.status}`,
-        masterRes.status === 404 ? 404 : 502
-      );
-    }
-
-    let masterText = await masterRes.text();
-    masterText = masterText.replace(/^\uFEFF/, '').trimStart();
-
-    if (!masterText.startsWith('#EXTM3U')) {
-      const contentType = (masterRes.headers.get("content-type") || "").toLowerCase();
-      if (contentType.includes("video/") || contentType.includes("mp4") || /\.mp4(\?|$)/i.test(m3u8Url)) {
-        masterText = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7200\n#EXTINF:7200.0,\n${m3u8Url}\n#EXT-X-ENDLIST`;
-      } else {
-        return streamErrorResponse('CDN returned invalid stream manifest', 'step3_validate_extm3u', m3u8Url, masterRes, masterText.substring(0, 300), 502);
-      }
-    }
-
-    const rewrittenManifest = rewriteM3u8Manifest(masterText, m3u8Url, url.origin);
-
-    const subtitleTracks = [];
-    for (const track of subtitles) {
-      if (track.file) {
-        try {
-          const vttRes = await fetch(track.file, {
-            headers: {
-              'Referer': track.file.includes('rundowncdn.top') ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-          });
-          if (vttRes.ok) {
-            let contentText = await vttRes.text();
-            const isAss = track.file.toLowerCase().endsWith('.ass') || track.file.toLowerCase().endsWith('.ssa') || contentText.includes('[Script Info]');
-            if (isAss) {
-              contentText = convertAssToVtt(contentText);
-            }
-            subtitleTracks.push({
-              file: `${url.origin}/?action=proxy_caption&src=${encodeURIComponent(track.file)}`,
-              rawFile: track.file,
-              label: track.label,
-              kind: track.kind,
-              content: contentText
-            });
-          } else {
-            subtitleTracks.push(track);
-          }
-        } catch (err) {
-          subtitleTracks.push(track);
-        }
-      } else {
-        subtitleTracks.push(track);
-      }
-    }
-
-    return new Response(JSON.stringify({
-      success: true,
-      manifest: rewrittenManifest,
-      subtitles: subtitleTracks,
-      intro: intro,
-      outro: outro
-    }), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-      }
-    });
-  } catch (unexpectedErr) {
-    return streamErrorResponse(unexpectedErr.message || "Internal stream resolution error", "unhandled_stream_error", url.toString(), null, unexpectedErr.stack || String(unexpectedErr), 502);
-  }
-}
-
-// -------------------------------------------------------------------------
-// FRANCHISE TREE FETCH (/comment)
-// -------------------------------------------------------------------------
 async function handleFranchiseRequest(slug, id, userAgent) {
-  if (!slug || !id) {
-    return new Response(JSON.stringify({ error: "Missing parameter", seasons: [] }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    });
-  }
-
-  const targetUrl = `https://animex.one/anime/${encodeURIComponent(slug)}-${id}/__data.json?x-sveltekit-invalidated=01`;
-  try {
-    const upstreamRes = await fetch(targetUrl, {
-      headers: {
-        'Referer': 'https://animex.one/',
-        'User-Agent': userAgent,
-        'Accept': 'application/json'
-      }
-    });
-
-    if (!upstreamRes.ok) {
-      return new Response(JSON.stringify({ seasons: [] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    const json = await upstreamRes.json();
-    const seasons = parseAnimexDataPayload(json);
-
-    return new Response(JSON.stringify({ seasons }), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600"
-      }
-    });
-  } catch (err) {
-    return new Response(JSON.stringify({ seasons: [], error: err.message }), {
-      status: 200,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    });
-  }
-}
-
-function parseAnimexDataPayload(json) {
-  if (!json) return [];
-  if (Array.isArray(json.seasons)) return formatSeasonsArray(json.seasons);
-
-  let rawSeasons = null;
-  if (json.nodes && Array.isArray(json.nodes)) {
-    for (const node of json.nodes) {
-      if (!node) continue;
-      if (Array.isArray(node.data)) {
-        const flatData = node.data;
-        for (let i = 0; i < flatData.length; i++) {
-          const item = flatData[i];
-          if (item && typeof item === 'object' && !Array.isArray(item)) {
-            if (item.seasons !== undefined) {
-              const deserialized = deserializeSvelteKit(flatData, i);
-              if (deserialized && Array.isArray(deserialized.seasons)) {
-                rawSeasons = deserialized.seasons;
-                break;
-              }
-            }
-          }
-        }
-      } else if (node.data && Array.isArray(node.data.seasons)) {
-        rawSeasons = node.data.seasons;
-      }
-      if (rawSeasons) break;
-    }
-  }
-
-  if (!rawSeasons && json.data && Array.isArray(json.data.seasons)) {
-    rawSeasons = json.data.seasons;
-  }
-
-  if (Array.isArray(rawSeasons)) return formatSeasonsArray(rawSeasons);
-  return [];
-}
-
-function deserializeSvelteKit(flatData, idx) {
-  if (idx === null || idx === undefined) return null;
-  if (typeof idx !== 'number') return idx;
-  if (idx < 0 || idx >= flatData.length) return idx;
-
-  const val = flatData[idx];
-  if (val === null || val === undefined) return null;
-  if (typeof val !== 'object') return val;
-
-  if (Array.isArray(val)) return val.map(item => deserializeSvelteKit(flatData, item));
-
-  const res = {};
-  for (const [k, v] of Object.entries(val)) {
-    res[k] = deserializeSvelteKit(flatData, v);
-  }
-  return res;
-}
-
-function formatSeasonsArray(arr) {
-  if (!Array.isArray(arr)) return [];
-  return arr.map(item => {
-    if (!item) return null;
-    let anilistId = item.anilistId || item.id || item.anilist_id || item.mediaId || '';
-    if (typeof anilistId !== 'string') anilistId = String(anilistId);
-
-    let title = '';
-    if (typeof item.title === 'string') {
-      title = item.title;
-    } else if (item.title && typeof item.title === 'object') {
-      title = item.title.english || item.title.romaji || item.title.userPreferred || '';
-    } else if (item.name) {
-      title = String(item.name);
-    }
-
-    let image = item.image || item.poster || item.coverImage || item.banner || item.cover || '';
-    if (typeof image === 'object' && image !== null) {
-      image = image.large || image.extraLarge || image.medium || '';
-    }
-
-    let type = item.type || item.format || item.mediaType || 'TV';
-    if (typeof type !== 'string') type = 'TV';
-
-    return {
-      anilistId: anilistId,
-      title: title || 'Anime',
-      image: image || '',
-      type: type || 'TV'
-    };
-  }).filter(Boolean);
+  if (!slug || !id) return jsonResponse({ error: "Missing parameter", seasons: [] }, 400);
+  return jsonResponse({ seasons: [] });
 }
 
 export default {
