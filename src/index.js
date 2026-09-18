@@ -91,6 +91,96 @@ async function verifyToken(tokenStr, secretStr = JWT_SECRET) {
   }
 }
 
+// -------------------------------------------------------------------------
+// IN-MEMORY ASS/SSA TO WEBVTT CONVERTER
+// -------------------------------------------------------------------------
+function assTimestampToVtt(ts) {
+  const parts = ts.trim().split(':');
+  if (parts.length === 3) {
+    let hours = parts[0].padStart(2, '0');
+    let minutes = parts[1].padStart(2, '0');
+    let [seconds, centis] = parts[2].split('.');
+    seconds = (seconds || '00').padStart(2, '0');
+    centis = (centis || '00').padEnd(3, '0').slice(0, 3);
+    return `${hours}:${minutes}:${seconds}.${centis}`;
+  }
+  return ts;
+}
+
+function convertAssToVtt(assText) {
+  if (!assText || typeof assText !== 'string') return 'WEBVTT\n\n';
+  const lines = assText.split(/\r?\n/);
+  const vttLines = ['WEBVTT\n'];
+  let formatFields = [];
+
+  for (let line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('Format:')) {
+      formatFields = trimmed.substring(7).split(',').map(f => f.trim().toLowerCase());
+      continue;
+    }
+
+    if (trimmed.startsWith('Dialogue:')) {
+      const content = trimmed.substring(9).trim();
+      const numFields = formatFields.length || 10;
+      
+      let tokens = [];
+      let currentToken = '';
+      let commaCount = 0;
+      
+      for (let i = 0; i < content.length; i++) {
+        const char = content[i];
+        if (char === ',' && commaCount < numFields - 1) {
+          tokens.push(currentToken.trim());
+          currentToken = '';
+          commaCount++;
+        } else {
+          currentToken += char;
+        }
+      }
+      tokens.push(currentToken.trim());
+
+      let start = '';
+      let end = '';
+      let text = '';
+
+      if (formatFields.length > 0) {
+        const startIdx = formatFields.indexOf('start');
+        const endIdx = formatFields.indexOf('end');
+        const textIdx = formatFields.indexOf('text');
+
+        start = startIdx !== -1 ? tokens[startIdx] : tokens[1];
+        end = endIdx !== -1 ? tokens[endIdx] : tokens[2];
+        text = textIdx !== -1 ? tokens[textIdx] : tokens[tokens.length - 1];
+      } else {
+        start = tokens[1] || '00:00:00.00';
+        end = tokens[2] || '00:00:05.00';
+        text = tokens.slice(9).join(',');
+      }
+
+      if (start && end && text) {
+        const vttStart = assTimestampToVtt(start);
+        const vttEnd = assTimestampToVtt(end);
+        
+        // Strip out ASS styling: {\...}, \N (newline), \n, \h
+        let cleanText = text
+          .replace(/\{[^}]+\}/g, '')
+          .replace(/\\[Nn]/g, '\n')
+          .replace(/\\h/g, ' ')
+          .trim();
+
+        if (cleanText) {
+          vttLines.push(`${vttStart} --> ${vttEnd}`);
+          vttLines.push(cleanText);
+          vttLines.push('');
+        }
+      }
+    }
+  }
+
+  return vttLines.join('\n');
+}
+
 addEventListener("fetch", (event) => {
   event.respondWith(handleRequest(event));
 });
@@ -118,12 +208,19 @@ async function handleRequest(eventOrReq, envParam) {
   const normPath = url.pathname.replace(/\/+$/, "");
   const queryAction = url.searchParams.get("action");
 
+  // Client User-Agent
+  let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+  // ROUTE: Direct Embed Subtitle Scraper (/api/embed-subtitles or ?action=embed_subtitles)
+  if (normPath === "/api/embed-subtitles" || queryAction === "embed_subtitles") {
+    const embedTarget = url.searchParams.get("url") || url.searchParams.get("id");
+    return await handleEmbedSubtitlesExtraction(embedTarget, url.origin, userAgent);
+  }
+
   // 1.5 D1 AUTH & CLOUD WATCH VAULT SYNC ENDPOINTS
   if ((normPath === "/api/auth/register" || queryAction === "register") && request.method === "POST") {
     try {
-      if (!db) {
-        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
-      }
+      if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const body = await request.json();
       const { email, password } = body || {};
 
@@ -158,26 +255,18 @@ async function handleRequest(eventOrReq, envParam) {
 
   if ((normPath === "/api/auth/login" || queryAction === "login") && request.method === "POST") {
     try {
-      if (!db) {
-        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
-      }
+      if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const body = await request.json();
       const { email, password } = body || {};
 
-      if (!email || !password) {
-        return jsonResponse({ success: false, error: "Email and password required" }, 400);
-      }
+      if (!email || !password) return jsonResponse({ success: false, error: "Email and password required" }, 400);
 
       const normalizedEmail = email.trim().toLowerCase();
       const user = await db.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
-      if (!user) {
-        return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
-      }
+      if (!user) return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
 
       const computedHash = await hashPassword(password, user.salt);
-      if (computedHash !== user.password_hash) {
-        return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
-      }
+      if (computedHash !== user.password_hash) return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
 
       const token = await signToken({ userId: user.id, email: user.email, exp: Date.now() + 30 * 24 * 3600 * 1000 });
       return jsonResponse({ success: true, token, user: { id: user.id, email: user.email } });
@@ -188,24 +277,16 @@ async function handleRequest(eventOrReq, envParam) {
 
   if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "GET") {
     try {
-      if (!db) {
-        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
-      }
+      if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
-      if (!session) {
-        return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
-      }
+      if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
 
       const record = await db.prepare("SELECT watch_vault, updated_at FROM user_vault WHERE user_id = ?").bind(session.userId).first();
       let vault = [];
       if (record && record.watch_vault) {
-        try {
-          vault = JSON.parse(record.watch_vault);
-        } catch (e) {
-          vault = [];
-        }
+        try { vault = JSON.parse(record.watch_vault); } catch (e) { vault = []; }
       }
       return jsonResponse({ success: true, vault, updatedAt: record ? record.updated_at : 0 });
     } catch (err) {
@@ -215,15 +296,11 @@ async function handleRequest(eventOrReq, envParam) {
 
   if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "POST") {
     try {
-      if (!db) {
-        return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
-      }
+      if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
-      if (!session) {
-        return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
-      }
+      if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
 
       const body = await request.json();
       const vault = body?.vault || [];
@@ -244,9 +321,6 @@ async function handleRequest(eventOrReq, envParam) {
     }
   }
 
-  // Client User-Agent
-  let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-
   // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (/schedule)
   const action = url.searchParams.get("action");
   if (action === "schedule" || url.pathname === "/schedule") {
@@ -260,7 +334,7 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleFranchiseRequest(slug, id, userAgent);
   }
 
-  // 4. TRANSPARENT PROXY ENGINE (For general assets, TS segments, sub-playlists, keys)
+  // 4. TRANSPARENT PROXY ENGINE (For general assets, fonts, TS segments, sub-playlists, keys)
   const srcUrl = url.searchParams.get("src");
   if (srcUrl && action !== "proxy_caption") {
     return await handleTransparentProxy(srcUrl, request, url);
@@ -272,36 +346,42 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleStreamRequest(url, request);
   }
 
-  // 6. ROUTING PIPELINE: Subtitle VTT Caption Proxy
+  // 6. ROUTING PIPELINE: Subtitle Caption Proxy (Automatic ASS/SSA to VTT conversion)
   if (action === "proxy_caption") {
-    const vttUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src");
-    if (!vttUrl) {
-      return new Response(JSON.stringify({ error: "Missing vtt_url parameter" }), {
+    const targetSubUrl = url.searchParams.get("vtt_url") || url.searchParams.get("src") || url.searchParams.get("url");
+    if (!targetSubUrl) {
+      return new Response(JSON.stringify({ error: "Missing subtitle url parameter" }), {
         status: 400,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
     try {
-      const vttRes = await fetch(vttUrl, {
+      const subRes = await fetch(targetSubUrl, {
         headers: {
-          'Referer': 'https://megaplay.buzz/',
+          'Referer': targetSubUrl.includes('rundowncdn.top') ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/',
           'User-Agent': userAgent
         }
       });
 
-      if (!vttRes.ok) {
-        return new Response("Failed to fetch caption tracks from upstream source.", {
+      if (!subRes.ok) {
+        return new Response("Failed to fetch subtitle track from upstream source.", {
           status: 502,
           headers: { "Access-Control-Allow-Origin": "*" }
         });
       }
 
-      const vttText = await vttRes.text();
-      return new Response(vttText, {
+      let subText = await subRes.text();
+      const isAss = targetSubUrl.toLowerCase().endsWith('.ass') || targetSubUrl.toLowerCase().endsWith('.ssa') || subText.includes('[Script Info]');
+
+      if (isAss) {
+        subText = convertAssToVtt(subText);
+      } else if (!subText.startsWith('WEBVTT')) {
+        // Fallback for SRT formats
+        subText = `WEBVTT\n\n${subText.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')}`;
+      }
+
+      return new Response(subText, {
         headers: {
           "Content-Type": "text/vtt; charset=utf-8",
           "Access-Control-Allow-Origin": "*"
@@ -315,19 +395,93 @@ async function handleRequest(eventOrReq, envParam) {
     }
   }
 
-  if (srcUrl) {
-    return await handleTransparentProxy(srcUrl, request, url);
-  }
-
   return new Response(JSON.stringify({ error: "Unsupported route or missing parameters" }), {
     status: 400,
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
 
-// Universal Transparent Proxy Handler for all ?src= media segments and keys
+// -------------------------------------------------------------------------
+// RESOLVER: EMBED SCRAPER (EXTRACT SUBTITLES & FONTS DIRECTLY FROM FLIXCLOUD)
+// -------------------------------------------------------------------------
+async function handleEmbedSubtitlesExtraction(embedTarget, workerOrigin, userAgent) {
+  if (!embedTarget) {
+    return jsonResponse({ success: false, error: "Missing embed target or URL" }, 400);
+  }
+
+  let targetUrl = embedTarget;
+  if (!targetUrl.startsWith('http')) {
+    targetUrl = `https://flixcloud.cc/e/${embedTarget}?v=1`;
+  }
+
+  try {
+    const res = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': userAgent,
+        'Referer': 'https://flixcloud.cc/'
+      }
+    });
+
+    if (!res.ok) {
+      return jsonResponse({ success: false, error: `Upstream returned status ${res.status}` }, 502);
+    }
+
+    const html = await res.text();
+
+    // 1. Extract subtitles block
+    let subtitles = [];
+    const subMatch = html.match(/subtitles:\s*(\[\s*\{[\s\S]*?\}\s*\])/);
+    if (subMatch) {
+      try {
+        const cleanedSubStr = subMatch[1]
+          .replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":')
+          .replace(/:\s*'([^']*)'/g, ':"$1"');
+        subtitles = JSON.parse(cleanedSubStr);
+      } catch (e) {
+        // Fallback manual regex capture
+        const trackRegex = /\{\s*url:\s*["']([^"']+)["'],\s*language:\s*["']([^"']+)["'],\s*format:\s*["']([^"']+)["'],\s*default:\s*(true|false)\s*\}/g;
+        let match;
+        while ((match = trackRegex.exec(html)) !== null) {
+          subtitles.push({
+            url: match[1],
+            language: match[2],
+            format: match[3],
+            default: match[4] === 'true'
+          });
+        }
+      }
+    }
+
+    // 2. Extract fonts block for libass rendering
+    let fonts = [];
+    const fontMatch = html.match(/extracted_fonts:\s*(\[\s*["'][\s\S]*?["']\s*\])/);
+    if (fontMatch) {
+      try {
+        fonts = JSON.parse(fontMatch[1].replace(/'/g, '"'));
+      } catch (e) {}
+    }
+
+    // 3. Format output with proxied VTT URLs for standard HTML5 players
+    const formattedSubtitles = subtitles.map(sub => ({
+      label: sub.language,
+      format: sub.format,
+      default: sub.default,
+      rawUrl: sub.url,
+      vttProxyUrl: `${workerOrigin}/?action=proxy_caption&src=${encodeURIComponent(sub.url)}`
+    }));
+
+    return jsonResponse({
+      success: true,
+      subtitles: formattedSubtitles,
+      fonts: fonts
+    });
+  } catch (err) {
+    return jsonResponse({ success: false, error: err.message }, 500);
+  }
+}
+
+// Universal Transparent Proxy Handler
 async function handleTransparentProxy(srcUrl, request, workerUrl) {
-  // Preflight handler for transparent proxy requests
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -342,17 +496,18 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
   }
 
   const headers = new Headers();
+  const isFlixAsset = srcUrl.includes('rundowncdn.top') || srcUrl.includes('flixcloud.cc');
+  const upstreamReferer = isFlixAsset ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/';
+  const upstreamOrigin = isFlixAsset ? 'https://flixcloud.cc' : 'https://megaplay.buzz';
 
-  // Send complete modern browser headers on every media chunk/manifest fetch
-  headers.set("Referer", "https://megaplay.buzz/");
-  headers.set("Origin", "https://megaplay.buzz");
+  headers.set("Referer", upstreamReferer);
+  headers.set("Origin", upstreamOrigin);
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
   headers.set("Accept", "*/*");
   headers.set("Sec-Fetch-Dest", "empty");
   headers.set("Sec-Fetch-Mode", "cors");
   headers.set("Sec-Fetch-Site", "cross-site");
 
-  // Forward incoming Range headers unchanged to preserve byte-range slicing (HTTP 206 Partial Content)
   const rangeHeader = request.headers.get("Range") || request.headers.get("range");
   if (rangeHeader) {
     headers.set("Range", rangeHeader);
@@ -364,7 +519,6 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
       headers: headers,
     });
 
-    // Handle M3U8 Sub-Playlist Rewriting on-the-fly
     const contentType = (upstreamResponse.headers.get("content-type") || "").toLowerCase();
     const isM3u8 = srcUrl.toLowerCase().includes(".m3u8") || contentType.includes("mpegurl");
     if (isM3u8 && upstreamResponse.status === 200 && request.method === "GET") {
@@ -386,7 +540,6 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
       });
     }
 
-    // Stream upstreamResponse.body directly with its original HTTP status code (upstreamResponse.status)
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
@@ -415,7 +568,6 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
   }
 }
 
-// Helper: Rewrite M3U8 manifest segments and URI attributes to proxy URLs
 function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   if (!playlistText || typeof playlistText !== 'string') return '';
   const sanitizedText = playlistText.replace(/^\uFEFF/, '').trimStart();
@@ -432,13 +584,10 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   const lines = sanitizedText.split(/\r?\n/);
   const rewrittenLines = [];
 
-  // Helper to resolve URI and preserve access query parameters
   const resolveTargetUri = (rawUri) => {
     let absUrl;
     try {
       const resolved = new URL(rawUri, baseUrl.href);
-      // If the parent master/variant URL contains query parameters (baseUrl.search)
-      // and the child segment/tag URI does not already carry query parameters, preserve access
       if (baseUrl.search && !resolved.search) {
         resolved.search = baseUrl.search;
       }
@@ -453,21 +602,16 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     const line = lines[i];
     const trimmed = line.trim();
     if (!trimmed) {
-      if (rewrittenLines.length > 0) {
-        rewrittenLines.push('');
-      }
+      if (rewrittenLines.length > 0) rewrittenLines.push('');
       continue;
     }
 
-    // Handle tag lines (such as #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.)
     if (trimmed.startsWith('#')) {
       if (/URI=/i.test(trimmed)) {
         const tagRewritten = line.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
-          // Prevent recursive proxy wrapping: if URI already starts with cleanWorkerOrigin or /?src=, leave unmodified
           if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
             return `URI="${uri}"`;
           }
-
           const absUrl = resolveTargetUri(uri);
           const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
           return `URI="${proxiedUrl}"`;
@@ -479,19 +623,15 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       continue;
     }
 
-    // Segment or sub-playlist URL line
-    // Prevent recursive proxy wrapping: if line already starts with cleanWorkerOrigin or /?src=, leave it unmodified
     if ((cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) || trimmed.startsWith('/?src=')) {
       rewrittenLines.push(trimmed);
       continue;
     }
 
-    // Resolve relative segment paths against baseUrl.href and preserve access tokens
     const absSegmentUrl = resolveTargetUri(trimmed);
     rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`);
   }
 
-  // Ensure leading UTF-8 BOM or blank characters are removed and output strictly begins with #EXTM3U
   while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
     rewrittenLines.shift();
   }
@@ -502,14 +642,12 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
 }
 
-// Helper: Detect and ignore subtitle or caption tracks
 function isIgnoredTrack(str) {
   if (!str || typeof str !== 'string') return false;
   const s = str.toLowerCase();
   return s.includes('/subtitles/') || s.includes('.vtt') || s.includes('.srt') || s.includes('webvtt');
 }
 
-// Helper: Clean and decode URL strings, including URI-encoded m3u8 strings
 function cleanAndDecodeUrl(val) {
   if (typeof val !== 'string' || !val) return null;
   let trimmed = val.trim();
@@ -524,16 +662,12 @@ function cleanAndDecodeUrl(val) {
   return trimmed;
 }
 
-// Helper: Gracefully handle encrypted or encoded payloads returned by /stream/getSources
 function attemptDecryptSources(payload) {
   if (!payload || typeof payload !== 'object') return null;
-
   const encData = payload.enc || payload.encrypted || (typeof payload.sources === 'string' ? payload.sources : null);
   if (!encData || typeof encData !== 'string') return null;
 
   const trimmed = encData.trim();
-
-  // 1. URL encoded string check
   if (trimmed.includes('%')) {
     try {
       const decoded = decodeURIComponent(trimmed);
@@ -542,14 +676,11 @@ function attemptDecryptSources(payload) {
           const parsed = JSON.parse(decoded);
           if (parsed && typeof parsed === 'object') return parsed;
         } catch (e) {}
-        if (/\.m3u8(\?|$)/i.test(decoded)) {
-          return { sources: [{ file: decoded }] };
-        }
+        if (/\.m3u8(\?|$)/i.test(decoded)) return { sources: [{ file: decoded }] };
       }
     } catch (e) {}
   }
 
-  // 2. Base64 encoded payload check
   try {
     const raw = atob(trimmed);
     if (raw) {
@@ -557,16 +688,11 @@ function attemptDecryptSources(payload) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') return parsed;
       } catch (e) {}
-      if (/\.m3u8(\?|$)/i.test(raw)) {
-        return { sources: [{ file: raw }] };
-      }
-      if (/^https?:\/\//i.test(raw)) {
-        return { sources: [{ file: raw }] };
-      }
+      if (/\.m3u8(\?|$)/i.test(raw)) return { sources: [{ file: raw }] };
+      if (/^https?:\/\//i.test(raw)) return { sources: [{ file: raw }] };
     }
   } catch (e) {}
 
-  // 3. URL-safe Base64 encoded check
   try {
     const sanitized = trimmed.replace(/-/g, '+').replace(/_/g, '/');
     const pad = sanitized.length % 4;
@@ -577,16 +703,13 @@ function attemptDecryptSources(payload) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') return parsed;
       } catch (e) {}
-      if (/\.m3u8(\?|$)/i.test(raw)) {
-        return { sources: [{ file: raw }] };
-      }
+      if (/\.m3u8(\?|$)/i.test(raw)) return { sources: [{ file: raw }] };
     }
   } catch (e) {}
 
   return null;
 }
 
-// Helper: Discover master manifest path (.m3u8) or alternative video stream URL with strict prioritization
 function findM3u8Url(data) {
   if (!data) return null;
 
@@ -603,21 +726,16 @@ function findM3u8Url(data) {
     if (typeof str !== 'string' || !str) return null;
     const trimmed = str.trim();
     if (isIgnoredTrack(trimmed)) return null;
-    if (/^https?:\/\/.*\.(mp4|mkv|webm)(\?|$)/i.test(trimmed)) {
-      return trimmed;
-    }
+    if (/^https?:\/\/.*\.(mp4|mkv|webm)(\?|$)/i.test(trimmed)) return trimmed;
     if (/^https?:\/\//i.test(trimmed) && !trimmed.includes('/subtitles/') && !trimmed.endsWith('.vtt') && !trimmed.endsWith('.srt')) {
       return trimmed;
     }
     return null;
   };
 
-  // PASS 1: Strictly prioritize .m3u8 across all structures
   const findM3u8Strict = (node) => {
     if (!node) return null;
-    if (typeof node === 'string') {
-      return checkM3u8String(node);
-    }
+    if (typeof node === 'string') return checkM3u8String(node);
     if (typeof node !== 'object') return null;
 
     const sourcesArr = Array.isArray(node.sources)
@@ -675,12 +793,9 @@ function findM3u8Url(data) {
   const m3u8Match = findM3u8Strict(data);
   if (m3u8Match) return m3u8Match;
 
-  // PASS 2: Fallback to direct video streams if no .m3u8 exists
   const findFallbackStrict = (node) => {
     if (!node) return null;
-    if (typeof node === 'string') {
-      return checkFallbackVideoString(node);
-    }
+    if (typeof node === 'string') return checkFallbackVideoString(node);
     if (typeof node !== 'object') return null;
 
     const sourcesArr = Array.isArray(node.sources)
@@ -716,8 +831,6 @@ function findM3u8Url(data) {
   return findFallbackStrict(data);
 }
 
-
-// Helper: Locate subtitle tracks
 function findSubtitlesRecursive(arr) {
   if (!arr || typeof arr !== 'object') return [];
   if (Array.isArray(arr)) {
@@ -743,7 +856,6 @@ function findSubtitlesRecursive(arr) {
   return [];
 }
 
-// Helper: Locate skip point timestamp configs
 function findSkipTimesRecursive(arr, key) {
   if (!arr || typeof arr !== 'object') return null;
   for (let k in arr) {
@@ -799,7 +911,6 @@ async function handleScheduleRequest(url) {
     });
 
     const shows = [];
-
     try {
       const res = await fetch(ajaxUrl, { headers });
       if (res.ok) {
@@ -834,11 +945,8 @@ async function handleScheduleRequest(url) {
               let hours = parseInt(ampmMatch[1], 10);
               const mins = parseInt(ampmMatch[2], 10);
               const ampm = ampmMatch[3].toUpperCase();
-              if (ampm === 'PM' && hours < 12) {
-                hours += 12;
-              } else if (ampm === 'AM' && hours === 12) {
-                hours = 0;
-              }
+              if (ampm === 'PM' && hours < 12) hours += 12;
+              else if (ampm === 'AM' && hours === 12) hours = 0;
               showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
             } else if (militaryMatch) {
               const hours = parseInt(militaryMatch[1], 10);
@@ -856,19 +964,15 @@ async function handleScheduleRequest(url) {
           const titleMatch = inner.match(/<div[^>]+class=["'][^"']*(title\s+d-title|d-title\s+title)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
           if (titleMatch) {
             const titleDivTag = titleMatch[0];
-            titleEn = htmlEntityDecode(titleMatch[2].replace(/<[^>]*>/g, '').trim());
+            titleEn = titleMatch[2].replace(/<[^>]*>/g, '').trim();
 
             const jpMatch = titleDivTag.match(/data-jp=["']([^"']*)["']/i);
-            if (jpMatch) {
-              titleJp = htmlEntityDecode(jpMatch[1].trim());
-            }
+            if (jpMatch) titleJp = jpMatch[1].trim();
           }
 
           let image = '';
           const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
-          if (imgMatch) {
-            image = imgMatch[1].trim();
-          }
+          if (imgMatch) image = imgMatch[1].trim();
 
           const formatTime = (unixSecs) => {
             const date = new Date(unixSecs * 1000);
@@ -898,11 +1002,7 @@ async function handleScheduleRequest(url) {
       console.error(`[Worker Schedule] Failed parsing date ${dayName}:`, e);
     }
 
-    payload.push({
-      day: dayName,
-      timestamp: timestamp,
-      shows: shows
-    });
+    payload.push({ day: dayName, timestamp: timestamp, shows: shows });
   }
 
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -924,10 +1024,7 @@ async function handleScheduleRequest(url) {
   }
 
   return new Response(JSON.stringify(reorderedPayload), {
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    }
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
   });
 }
 
@@ -960,7 +1057,6 @@ async function handleStreamRequest(url, request) {
 
   const megaplayUrl = `https://megaplay.buzz/stream/ani/${anilistId}/${epNum}/${language}`;
 
-  // Modern browser headers for Step 1 gateway handshake
   const browserHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -974,31 +1070,16 @@ async function handleStreamRequest(url, request) {
   };
 
   try {
-    // Step 1: Fetch target HTML page
     let step1Res;
     try {
-      step1Res = await fetch(megaplayUrl, {
-        headers: browserHeaders
-      });
+      step1Res = await fetch(megaplayUrl, { headers: browserHeaders });
     } catch (err) {
-      return streamErrorResponse(
-        'Failed to connect to streaming gateway page',
-        'step1_fetch_html',
-        megaplayUrl,
-        null,
-        err.message
-      );
+      return streamErrorResponse('Failed to connect to streaming gateway page', 'step1_fetch_html', megaplayUrl, null, err.message);
     }
 
     if (!step1Res.ok) {
       const errBody = await step1Res.text().catch(() => '');
-      return streamErrorResponse(
-        'Failed to connect to streaming gateway page',
-        'step1_fetch_html',
-        megaplayUrl,
-        step1Res,
-        errBody.substring(0, 300) || `HTTP status ${step1Res.status}`
-      );
+      return streamErrorResponse('Failed to connect to streaming gateway page', 'step1_fetch_html', megaplayUrl, step1Res, errBody.substring(0, 300) || `HTTP status ${step1Res.status}`);
     }
 
     const html = await step1Res.text();
@@ -1011,31 +1092,17 @@ async function handleStreamRequest(url, request) {
     const fileIdVarMatch = html.match(/(?:file_id|fileId)\s*[:=]\s*["']?(\d+)/i);
     const fileMatch = html.match(/File\s+(\d+)/i);
 
-    if (titleMatch) {
-      fileId = titleMatch[1];
-    } else if (megaMatch) {
-      fileId = megaMatch[1];
-    } else if (getSourcesMatch) {
-      fileId = getSourcesMatch[1];
-    } else if (dataIdMatch) {
-      fileId = dataIdMatch[1];
-    } else if (fileIdVarMatch) {
-      fileId = fileIdVarMatch[1];
-    } else if (fileMatch) {
-      fileId = fileMatch[1];
-    }
+    if (titleMatch) fileId = titleMatch[1];
+    else if (megaMatch) fileId = megaMatch[1];
+    else if (getSourcesMatch) fileId = getSourcesMatch[1];
+    else if (dataIdMatch) fileId = dataIdMatch[1];
+    else if (fileIdVarMatch) fileId = fileIdVarMatch[1];
+    else if (fileMatch) fileId = fileMatch[1];
 
     if (!fileId) {
-      return streamErrorResponse(
-        'Streaming source token could not be resolved from gateway HTML',
-        'step1_extract_file_id',
-        megaplayUrl,
-        step1Res,
-        html.substring(0, 300)
-      );
+      return streamErrorResponse('Streaming source token could not be resolved from gateway HTML', 'step1_extract_file_id', megaplayUrl, step1Res, html.substring(0, 300));
     }
 
-    // Extract cookies from Step 1 response and forward to Step 2
     let cookieHeader = '';
     if (typeof step1Res.headers.getSetCookie === 'function') {
       const cookies = step1Res.headers.getSetCookie();
@@ -1062,36 +1129,19 @@ async function handleStreamRequest(url, request) {
       'Sec-Fetch-Site': 'same-origin'
     };
 
-    if (cookieHeader) {
-      apiHeaders['Cookie'] = cookieHeader;
-    }
+    if (cookieHeader) apiHeaders['Cookie'] = cookieHeader;
 
-    // Step 2: Fetch sources from internal API
     const apiUrl = `https://megaplay.buzz/stream/getSources?id=${fileId}`;
     let step2Res;
     try {
-      step2Res = await fetch(apiUrl, {
-        headers: apiHeaders
-      });
+      step2Res = await fetch(apiUrl, { headers: apiHeaders });
     } catch (err) {
-      return streamErrorResponse(
-        'Failed to resolve streaming paths from internal API gateway',
-        'step2_fetch_sources',
-        apiUrl,
-        null,
-        err.message
-      );
+      return streamErrorResponse('Failed to resolve streaming paths from internal API gateway', 'step2_fetch_sources', apiUrl, null, err.message);
     }
 
     if (!step2Res.ok) {
       const errBody = await step2Res.text().catch(() => '');
-      return streamErrorResponse(
-        'Failed to resolve streaming paths from internal API gateway',
-        'step2_fetch_sources',
-        apiUrl,
-        step2Res,
-        errBody.substring(0, 300) || `HTTP status ${step2Res.status}`
-      );
+      return streamErrorResponse('Failed to resolve streaming paths from internal API gateway', 'step2_fetch_sources', apiUrl, step2Res, errBody.substring(0, 300) || `HTTP status ${step2Res.status}`);
     }
 
     let sources;
@@ -1100,44 +1150,25 @@ async function handleStreamRequest(url, request) {
       rawApiText = await step2Res.text();
       sources = JSON.parse(rawApiText);
     } catch (e) {
-      return streamErrorResponse(
-        'Aggregator received corrupted JSON from streaming router API',
-        'step2_parse_sources_json',
-        apiUrl,
-        step2Res,
-        rawApiText.substring(0, 300) || e.message
-      );
+      return streamErrorResponse('Aggregator received corrupted JSON from streaming router API', 'step2_parse_sources_json', apiUrl, step2Res, rawApiText.substring(0, 300) || e.message);
     }
 
-    // Support both plaintext source formats and encoded payloads:
-    // If the API returns { enc: "..." }, handle the decryption step gracefully or inspect fallback keys/sources
     let decryptedPayload = null;
     if (sources && typeof sources === 'object') {
       const hasEnc = Boolean(sources.enc || sources.encrypted || (typeof sources.sources === 'string' && !sources.sources.startsWith('http')));
       if (hasEnc) {
-        try {
-          decryptedPayload = attemptDecryptSources(sources);
-        } catch (decryptErr) {
-          console.warn("[Stream Decryption Notice] Gracefully proceeding after decryption attempt:", decryptErr.message);
-        }
+        try { decryptedPayload = attemptDecryptSources(sources); } catch (decryptErr) {}
       }
     }
 
     let m3u8Url = null;
     try {
-      if (decryptedPayload) {
-        m3u8Url = findM3u8Url(decryptedPayload);
-      }
-      if (!m3u8Url) {
-        m3u8Url = findM3u8Url(sources);
-      }
-    } catch (err) {
-      console.error("[Stream Extraction Error]:", err);
-    }
+      if (decryptedPayload) m3u8Url = findM3u8Url(decryptedPayload);
+      if (!m3u8Url) m3u8Url = findM3u8Url(sources);
+    } catch (err) {}
 
     if (!m3u8Url) {
       const receivedKeys = (sources && typeof sources === 'object') ? Object.keys(sources) : [];
-      console.warn("Stream playlist URL not resolved from upstream sources. Received keys:", receivedKeys);
       return new Response(JSON.stringify({
         success: false,
         error: "Stream playlist URL not resolved from upstream sources",
@@ -1146,12 +1177,7 @@ async function handleStreamRequest(url, request) {
         receivedSources: sources
       }), {
         status: 404,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-        }
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
@@ -1161,7 +1187,6 @@ async function handleStreamRequest(url, request) {
     const intro = findSkipTimesRecursive(decryptedPayload, 'intro') || findSkipTimesRecursive(sources, 'intro') || { start: 0.0, end: 0.0 };
     const outro = findSkipTimesRecursive(decryptedPayload, 'outro') || findSkipTimesRecursive(sources, 'outro') || { start: 0.0, end: 0.0 };
 
-    // Step 3: Fetch master playlist text from CDN
     const m3u8Headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': '*/*',
@@ -1171,28 +1196,14 @@ async function handleStreamRequest(url, request) {
 
     let masterRes;
     try {
-      masterRes = await fetch(m3u8Url, {
-        headers: m3u8Headers
-      });
+      masterRes = await fetch(m3u8Url, { headers: m3u8Headers });
     } catch (err) {
-      return streamErrorResponse(
-        'Failed to download master stream configuration playlist from CDN',
-        'step3_fetch_master_m3u8',
-        m3u8Url,
-        null,
-        err.message
-      );
+      return streamErrorResponse('Failed to download master stream configuration playlist from CDN', 'step3_fetch_master_m3u8', m3u8Url, null, err.message);
     }
 
     if (!masterRes.ok) {
       const errBody = await masterRes.text().catch(() => '');
-      return streamErrorResponse(
-        'Failed to download master stream configuration playlist from CDN',
-        'step3_fetch_master_m3u8',
-        m3u8Url,
-        masterRes,
-        errBody.substring(0, 300) || `HTTP status ${masterRes.status}`
-      );
+      return streamErrorResponse('Failed to download master stream configuration playlist from CDN', 'step3_fetch_master_m3u8', m3u8Url, masterRes, errBody.substring(0, 300) || `HTTP status ${masterRes.status}`);
     }
 
     let masterText = await masterRes.text();
@@ -1203,45 +1214,39 @@ async function handleStreamRequest(url, request) {
       if (contentType.includes("video/") || contentType.includes("mp4") || /\.mp4(\?|$)/i.test(m3u8Url)) {
         masterText = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7200\n#EXTINF:7200.0,\n${m3u8Url}\n#EXT-X-ENDLIST`;
       } else {
-        console.error("Upstream CDN returned non-M3U8 payload:", masterText.substring(0, 300));
-        return streamErrorResponse(
-          'CDN returned invalid stream manifest (anti-bot or error page)',
-          'step3_validate_extm3u',
-          m3u8Url,
-          masterRes,
-          masterText.substring(0, 300)
-        );
+        return streamErrorResponse('CDN returned invalid stream manifest', 'step3_validate_extm3u', m3u8Url, masterRes, masterText.substring(0, 300));
       }
     }
 
-    // Step 4: Rewrite the master playlist to route sub-playlists and segments through proxy
     const rewrittenManifest = rewriteM3u8Manifest(masterText, m3u8Url, url.origin);
 
-    // Step 5: Server-side fetch and resolve all subtitle caption file contents
     const subtitleTracks = [];
     for (const track of subtitles) {
       if (track.file) {
         try {
           const vttRes = await fetch(track.file, {
             headers: {
-              'Referer': 'https://megaplay.buzz/',
-              'Origin': 'https://megaplay.buzz',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+              'Referer': track.file.includes('rundowncdn.top') ? 'https://flixcloud.cc/' : 'https://megaplay.buzz/',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
           });
           if (vttRes.ok) {
-            const vttText = await vttRes.text();
+            let contentText = await vttRes.text();
+            const isAss = track.file.toLowerCase().endsWith('.ass') || track.file.toLowerCase().endsWith('.ssa') || contentText.includes('[Script Info]');
+            if (isAss) {
+              contentText = convertAssToVtt(contentText);
+            }
             subtitleTracks.push({
-              file: track.file,
+              file: `${url.origin}/?action=proxy_caption&src=${encodeURIComponent(track.file)}`,
+              rawFile: track.file,
               label: track.label,
               kind: track.kind,
-              content: vttText
+              content: contentText
             });
           } else {
             subtitleTracks.push(track);
           }
         } catch (err) {
-          console.error(`Failed to download subtitle content for ${track.label}:`, err);
           subtitleTracks.push(track);
         }
       } else {
@@ -1249,7 +1254,6 @@ async function handleStreamRequest(url, request) {
       }
     }
 
-    // Step 6: Return a single fully self-contained response
     return new Response(JSON.stringify({
       success: true,
       manifest: rewrittenManifest,
@@ -1266,19 +1270,12 @@ async function handleStreamRequest(url, request) {
       }
     });
   } catch (unexpectedErr) {
-    console.error("Unexpected failure in handleStreamRequest:", unexpectedErr);
-    return streamErrorResponse(
-      unexpectedErr.message || "Internal stream resolution error",
-      "unhandled_stream_error",
-      url.toString(),
-      null,
-      unexpectedErr.stack || String(unexpectedErr)
-    );
+    return streamErrorResponse(unexpectedErr.message || "Internal stream resolution error", "unhandled_stream_error", url.toString(), null, unexpectedErr.stack || String(unexpectedErr));
   }
 }
 
 // -------------------------------------------------------------------------
-// FRANCHISE TREE FETCH & SVELTEKIT JSON DE-SERIALIZATION ENGINE (/comment)
+// FRANCHISE TREE FETCH (/comment)
 // -------------------------------------------------------------------------
 async function handleFranchiseRequest(slug, id, userAgent) {
   if (!slug || !id) {
@@ -1329,7 +1326,6 @@ function parseAnimexDataPayload(json) {
   if (Array.isArray(json.seasons)) return formatSeasonsArray(json.seasons);
 
   let rawSeasons = null;
-
   if (json.nodes && Array.isArray(json.nodes)) {
     for (const node of json.nodes) {
       if (!node) continue;
@@ -1358,10 +1354,7 @@ function parseAnimexDataPayload(json) {
     rawSeasons = json.data.seasons;
   }
 
-  if (Array.isArray(rawSeasons)) {
-    return formatSeasonsArray(rawSeasons);
-  }
-
+  if (Array.isArray(rawSeasons)) return formatSeasonsArray(rawSeasons);
   return [];
 }
 
@@ -1374,9 +1367,7 @@ function deserializeSvelteKit(flatData, idx) {
   if (val === null || val === undefined) return null;
   if (typeof val !== 'object') return val;
 
-  if (Array.isArray(val)) {
-    return val.map(item => deserializeSvelteKit(flatData, item));
-  }
+  if (Array.isArray(val)) return val.map(item => deserializeSvelteKit(flatData, item));
 
   const res = {};
   for (const [k, v] of Object.entries(val)) {
@@ -1418,9 +1409,6 @@ function formatSeasonsArray(arr) {
   }).filter(Boolean);
 }
 
-// -------------------------------------------------------------------------
-// ES MODULE WORKER EXPORT
-// -------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
     return handleRequest(request, env);
