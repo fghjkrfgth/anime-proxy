@@ -463,7 +463,11 @@ function adjustMasterManifestAudio(masterText, preferredLang) {
           if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
           if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
         } else if (isNative) {
-          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
+          trimmed = trimmed
+            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO")
+            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=NO");
+          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=NO';
+          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=NO';
         }
       } else {
         // sub / native
@@ -474,7 +478,11 @@ function adjustMasterManifestAudio(masterText, preferredLang) {
           if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
           if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
         } else if (isEnglish) {
-          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
+          trimmed = trimmed
+            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO")
+            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=NO");
+          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=NO';
+          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=NO';
         }
       }
     }
@@ -837,6 +845,10 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("set-cookie");
+
+    if (cleanSrcUrl.toLowerCase().includes(".ts") || contentType.includes("video/mp2t")) {
+      responseHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
+    }
 
     const responseBody = request.method === "HEAD" ? null : upstreamResponse.body;
 
