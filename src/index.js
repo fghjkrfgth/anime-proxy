@@ -493,6 +493,12 @@ async function handleFlixCloudStreamRequest(url, request) {
   const lang = (url.searchParams.get("lang") || url.searchParams.get("language") || "sub").toLowerCase();
   let dataLink = url.searchParams.get("server") || url.searchParams.get("dataLink");
 
+  // Normalize server dataLink: Flixcloud v=2 uses proprietary non-HLS WASM obfuscation with dummy image headers (WebP/PNG without AES-128 key)
+  // that breaks standard Hls.js in browser. Normalizing v=2 to v=1 guarantees delivery of the standard AES-128 HLS stream.
+  if (dataLink) {
+    dataLink = dataLink.replace(/([?&])v=2\b/, '$1v=1');
+  }
+
   // Step 1: If dataLink was not provided directly by client, resolve via reanime.to
   if (!dataLink && anilistId) {
     try {
@@ -508,6 +514,10 @@ async function handleFlixCloudStreamRequest(url, request) {
         if (found) dataLink = found.dataLink;
       }
     } catch (e) { }
+  }
+
+  if (dataLink) {
+    dataLink = dataLink.replace(/([?&])v=2\b/, '$1v=1');
   }
 
   if (!dataLink) {
