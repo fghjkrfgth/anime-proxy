@@ -514,10 +514,55 @@ async function ensureDbSchema(db) {
         incomingWatched = incomingVault;
       }
 
+      // Direct replacement for liked & watchLater snapshots so deletions persist in D1
+      let newLiked = existingVault.liked || {};
+      if (incomingVault.liked !== undefined) {
+        newLiked = {};
+        const likedEntries = Array.isArray(incomingVault.liked)
+          ? incomingVault.liked.map(it => [String(it?.id || '').trim(), it])
+          : Object.entries(incomingVault.liked);
+        for (const [k, it] of likedEntries) {
+          const cleanKey = String(k || it?.id || '').trim();
+          if (cleanKey && it) {
+            newLiked[cleanKey] = {
+              id: cleanKey,
+              title: it.title,
+              coverImage: it.coverImage,
+              bannerImage: it.bannerImage || it.banner || '',
+              meanScore: it.meanScore || it.averageScore || it.rating || 0,
+              format: it.format || 'TV',
+              addedAt: it.addedAt || Date.now()
+            };
+          }
+        }
+      }
+
+      let newWatchLater = existingVault.watchLater || {};
+      if (incomingVault.watchLater !== undefined) {
+        newWatchLater = {};
+        const wlEntries = Array.isArray(incomingVault.watchLater)
+          ? incomingVault.watchLater.map(it => [String(it?.id || '').trim(), it])
+          : Object.entries(incomingVault.watchLater);
+        for (const [k, it] of wlEntries) {
+          const cleanKey = String(k || it?.id || '').trim();
+          if (cleanKey && it) {
+            newWatchLater[cleanKey] = {
+              id: cleanKey,
+              title: it.title,
+              coverImage: it.coverImage,
+              bannerImage: it.bannerImage || it.banner || '',
+              meanScore: it.meanScore || it.averageScore || it.rating || 0,
+              format: it.format || 'TV',
+              addedAt: it.addedAt || Date.now()
+            };
+          }
+        }
+      }
+
       const mergedVault = {
         watched: mergeCollection(existingVault.watched, incomingWatched),
-        liked: mergeCollection(existingVault.liked, incomingVault.liked),
-        watchLater: mergeCollection(existingVault.watchLater, incomingVault.watchLater)
+        liked: newLiked,
+        watchLater: newWatchLater
       };
 
       const now = Date.now();
