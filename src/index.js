@@ -255,10 +255,18 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleEmbedSubtitlesExtraction(embedTarget, url.origin, userAgent);
   }
 
-  // 1.5 D1 AUTH & CLOUD WATCH VAULT SYNC ENDPOINTS
+async function ensureDbSchema(db) {
+  if (!db) return;
+  try { await db.prepare("ALTER TABLE users ADD COLUMN username TEXT").run(); } catch (e) {}
+  try { await db.prepare("ALTER TABLE users ADD COLUMN avatar_url TEXT").run(); } catch (e) {}
+  try { await db.prepare("ALTER TABLE users ADD COLUMN bio TEXT").run(); } catch (e) {}
+}
+
+  // 1.5 D1 AUTH, PROFILE & CLOUD WATCH VAULT SYNC ENDPOINTS
   if ((normPath === "/api/auth/register" || queryAction === "register") && request.method === "POST") {
     try {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      await ensureDbSchema(db);
       const body = await request.json();
       const { email, password } = body || {};
 
@@ -270,9 +278,12 @@ async function handleRequest(eventOrReq, envParam) {
       }
 
       const normalizedEmail = email.trim().toLowerCase();
-      const existing = await db.prepare("SELECT id FROM users WHERE email = ?").bind(normalizedEmail).first();
+      const existing = await db.prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(?)").bind(normalizedEmail).first();
       if (existing) {
-        return jsonResponse({ success: false, error: "An account with this email already exists" }, 409);
+        return jsonResponse({
+          success: false,
+          error: "An account with this email address already exists. Please sign in instead."
+        }, 409);
       }
 
       const saltBytes = crypto.getRandomValues(new Uint8Array(16));
@@ -280,12 +291,25 @@ async function handleRequest(eventOrReq, envParam) {
       const passwordHash = await hashPassword(password, saltHex);
       const userId = crypto.randomUUID();
       const now = Date.now();
+      const defaultUsername = (body.username && typeof body.username === 'string' && body.username.trim())
+        ? body.username.trim()
+        : normalizedEmail.split('@')[0];
+      const avatarUrl = (body.avatar_url && typeof body.avatar_url === 'string') ? body.avatar_url.trim() : '';
+      const bio = (body.bio && typeof body.bio === 'string') ? body.bio.trim() : '';
 
-      await db.prepare("INSERT INTO users (id, email, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)").bind(userId, normalizedEmail, passwordHash, saltHex, now).run();
-      await db.prepare("INSERT INTO user_vault (user_id, watch_vault, updated_at) VALUES (?, ?, ?)").bind(userId, JSON.stringify([]), now).run();
+      await db.prepare(
+        "INSERT INTO users (id, email, password_hash, salt, username, avatar_url, bio, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(userId, normalizedEmail, passwordHash, saltHex, defaultUsername, avatarUrl, bio, now).run();
+
+      const initialVault = JSON.stringify({ watched: {}, liked: {}, watchLater: {} });
+      await db.prepare("INSERT INTO user_vault (user_id, watch_vault, updated_at) VALUES (?, ?, ?)").bind(userId, initialVault, now).run();
 
       const token = await signToken({ userId, email: normalizedEmail, exp: Date.now() + 30 * 24 * 3600 * 1000 });
-      return jsonResponse({ success: true, token, user: { id: userId, email: normalizedEmail } });
+      return jsonResponse({
+        success: true,
+        token,
+        user: { id: userId, email: normalizedEmail, username: defaultUsername, avatar_url: avatarUrl, bio, created_at: now }
+      });
     } catch (err) {
       return jsonResponse({ success: false, error: err.message || "Registration failed" }, 500);
     }
@@ -294,39 +318,138 @@ async function handleRequest(eventOrReq, envParam) {
   if ((normPath === "/api/auth/login" || queryAction === "login") && request.method === "POST") {
     try {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      await ensureDbSchema(db);
       const body = await request.json();
       const { email, password } = body || {};
 
       if (!email || !password) return jsonResponse({ success: false, error: "Email and password required" }, 400);
 
       const normalizedEmail = email.trim().toLowerCase();
-      const user = await db.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
+      const user = await db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").bind(normalizedEmail).first();
       if (!user) return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
 
       const computedHash = await hashPassword(password, user.salt);
       if (computedHash !== user.password_hash) return jsonResponse({ success: false, error: "Invalid email or password" }, 401);
 
       const token = await signToken({ userId: user.id, email: user.email, exp: Date.now() + 30 * 24 * 3600 * 1000 });
-      return jsonResponse({ success: true, token, user: { id: user.id, email: user.email } });
+      return jsonResponse({
+        success: true,
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          username: user.username || user.email.split('@')[0],
+          avatar_url: user.avatar_url || '',
+          bio: user.bio || '',
+          created_at: user.created_at
+        }
+      });
     } catch (err) {
       return jsonResponse({ success: false, error: err.message || "Login failed" }, 500);
+    }
+  }
+
+  if (normPath === "/api/user/profile" || queryAction === "profile") {
+    try {
+      if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      await ensureDbSchema(db);
+      const authHeader = request.headers.get("Authorization") || "";
+      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+      const session = await verifyToken(token);
+      if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
+
+      if (request.method === "GET") {
+        const user = await db.prepare("SELECT id, email, username, avatar_url, bio, created_at FROM users WHERE id = ?").bind(session.userId).first();
+        if (!user) return jsonResponse({ success: false, error: "User not found" }, 404);
+        return jsonResponse({
+          success: true,
+          profile: {
+            id: user.id,
+            email: user.email,
+            username: user.username || user.email.split('@')[0],
+            avatar_url: user.avatar_url || '',
+            bio: user.bio || '',
+            created_at: user.created_at
+          }
+        });
+      }
+
+      if (request.method === "POST" || request.method === "PUT") {
+        const user = await db.prepare("SELECT * FROM users WHERE id = ?").bind(session.userId).first();
+        if (!user) return jsonResponse({ success: false, error: "User not found" }, 404);
+
+        const body = await request.json();
+        const newUsername = (body.username !== undefined && typeof body.username === 'string') ? body.username.trim() : user.username;
+        const newAvatar = (body.avatar_url !== undefined && typeof body.avatar_url === 'string') ? body.avatar_url.trim() : user.avatar_url;
+        const newBio = (body.bio !== undefined && typeof body.bio === 'string') ? body.bio.trim() : user.bio;
+
+        await db.prepare("UPDATE users SET username = ?, avatar_url = ?, bio = ? WHERE id = ?")
+          .bind(newUsername, newAvatar, newBio, session.userId).run();
+
+        return jsonResponse({
+          success: true,
+          profile: {
+            id: user.id,
+            email: user.email,
+            username: newUsername || user.email.split('@')[0],
+            avatar_url: newAvatar || '',
+            bio: newBio || '',
+            created_at: user.created_at
+          }
+        });
+      }
+
+      return jsonResponse({ success: false, error: "Method not allowed" }, 405);
+    } catch (err) {
+      return jsonResponse({ success: false, error: err.message || "Profile operation failed" }, 500);
     }
   }
 
   if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "GET") {
     try {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      await ensureDbSchema(db);
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
       if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
 
       const record = await db.prepare("SELECT watch_vault, updated_at FROM user_vault WHERE user_id = ?").bind(session.userId).first();
-      let vault = [];
+      const user = await db.prepare("SELECT id, email, username, avatar_url, bio, created_at FROM users WHERE id = ?").bind(session.userId).first();
+
+      let vault = { watched: {}, liked: {}, watchLater: {} };
       if (record && record.watch_vault) {
-        try { vault = JSON.parse(record.watch_vault); } catch (e) { vault = []; }
+        try {
+          const parsed = JSON.parse(record.watch_vault);
+          if (parsed && (parsed.watched || parsed.liked || parsed.watchLater)) {
+            vault.watched = parsed.watched || {};
+            vault.liked = parsed.liked || {};
+            vault.watchLater = parsed.watchLater || {};
+          } else if (parsed && typeof parsed === 'object') {
+            vault.watched = Array.isArray(parsed)
+              ? parsed.reduce((acc, it) => { if (it && it.id) acc[String(it.id)] = it; return acc; }, {})
+              : parsed;
+          }
+        } catch (e) {
+          vault = { watched: {}, liked: {}, watchLater: {} };
+        }
       }
-      return jsonResponse({ success: true, vault, updatedAt: record ? record.updated_at : 0 });
+
+      const profile = user ? {
+        id: user.id,
+        email: user.email,
+        username: user.username || user.email.split('@')[0],
+        avatar_url: user.avatar_url || '',
+        bio: user.bio || '',
+        created_at: user.created_at
+      } : null;
+
+      return jsonResponse({
+        success: true,
+        vault,
+        profile,
+        updatedAt: record ? record.updated_at : 0
+      });
     } catch (err) {
       return jsonResponse({ success: false, error: err.message || "Sync failed" }, 500);
     }
@@ -335,25 +458,78 @@ async function handleRequest(eventOrReq, envParam) {
   if ((normPath === "/api/user/sync" || queryAction === "sync") && request.method === "POST") {
     try {
       if (!db) return jsonResponse({ success: false, error: "D1 database binding 'DB' not found" }, 500);
+      await ensureDbSchema(db);
       const authHeader = request.headers.get("Authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       const session = await verifyToken(token);
       if (!session) return jsonResponse({ success: false, error: "Unauthorized or expired session token" }, 401);
 
       const body = await request.json();
-      const vault = body?.vault || [];
-      const vaultStr = JSON.stringify(vault);
-      const now = Date.now();
+      const incomingVault = body?.vault || {};
 
+      // Load existing vault for non-destructive merge
+      const record = await db.prepare("SELECT watch_vault FROM user_vault WHERE user_id = ?").bind(session.userId).first();
+      let existingVault = { watched: {}, liked: {}, watchLater: {} };
+      if (record && record.watch_vault) {
+        try {
+          const parsed = JSON.parse(record.watch_vault);
+          if (parsed && (parsed.watched || parsed.liked || parsed.watchLater)) {
+            existingVault.watched = parsed.watched || {};
+            existingVault.liked = parsed.liked || {};
+            existingVault.watchLater = parsed.watchLater || {};
+          } else if (parsed && typeof parsed === 'object') {
+            existingVault.watched = Array.isArray(parsed)
+              ? parsed.reduce((acc, it) => { if (it && it.id) acc[String(it.id)] = it; return acc; }, {})
+              : parsed;
+          }
+        } catch (e) {}
+      }
+
+      function mergeCollection(target, source) {
+        const out = { ...target };
+        if (!source) return out;
+        const entries = Array.isArray(source)
+          ? source.map(item => [String(item?.id || item?.show?.id || ''), item])
+          : Object.entries(source);
+
+        for (const [key, item] of entries) {
+          if (!key || !item) continue;
+          const current = out[key];
+          if (!current) {
+            out[key] = item;
+          } else {
+            const inTime = item.updatedAt || item.addedAt || 0;
+            const curTime = current.updatedAt || current.addedAt || 0;
+            if (inTime >= curTime) {
+              out[key] = { ...current, ...item };
+            }
+          }
+        }
+        return out;
+      }
+
+      // Check if incoming is legacy array or unified map
+      let incomingWatched = incomingVault.watched;
+      if (!incomingWatched && (Array.isArray(incomingVault) || (typeof incomingVault === 'object' && !incomingVault.liked && !incomingVault.watchLater))) {
+        incomingWatched = incomingVault;
+      }
+
+      const mergedVault = {
+        watched: mergeCollection(existingVault.watched, incomingWatched),
+        liked: mergeCollection(existingVault.liked, incomingVault.liked),
+        watchLater: mergeCollection(existingVault.watchLater, incomingVault.watchLater)
+      };
+
+      const now = Date.now();
       await db.prepare(`
         INSERT INTO user_vault (user_id, watch_vault, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
           watch_vault = excluded.watch_vault,
           updated_at = excluded.updated_at
-      `).bind(session.userId, vaultStr, now).run();
+      `).bind(session.userId, JSON.stringify(mergedVault), now).run();
 
-      return jsonResponse({ success: true, updatedAt: now });
+      return jsonResponse({ success: true, vault: mergedVault, updatedAt: now });
     } catch (err) {
       return jsonResponse({ success: false, error: err.message || "Sync failed" }, 500);
     }
@@ -463,11 +639,7 @@ function adjustMasterManifestAudio(masterText, preferredLang) {
           if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
           if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
         } else if (isNative) {
-          trimmed = trimmed
-            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO")
-            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=NO");
-          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=NO';
-          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=NO';
+          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
         }
       } else {
         // sub / native
@@ -478,11 +650,7 @@ function adjustMasterManifestAudio(masterText, preferredLang) {
           if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=YES';
           if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=YES';
         } else if (isEnglish) {
-          trimmed = trimmed
-            .replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO")
-            .replace(/AUTOSELECT=(YES|NO)/gi, "AUTOSELECT=NO");
-          if (!/DEFAULT=/i.test(trimmed)) trimmed += ',DEFAULT=NO';
-          if (!/AUTOSELECT=/i.test(trimmed)) trimmed += ',AUTOSELECT=NO';
+          trimmed = trimmed.replace(/DEFAULT=(YES|NO)/gi, "DEFAULT=NO");
         }
       }
     }
@@ -845,10 +1013,6 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
     responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("set-cookie");
-
-    if (cleanSrcUrl.toLowerCase().includes(".ts") || contentType.includes("video/mp2t")) {
-      responseHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
-    }
 
     const responseBody = request.method === "HEAD" ? null : upstreamResponse.body;
 
