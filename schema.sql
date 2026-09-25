@@ -1,10 +1,11 @@
--- Initial D1 Database Schema for BlackLeg Auth & Watch Vault Sync
-
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
+    username TEXT,
+    avatar_url TEXT,
+    bio TEXT,
     created_at INTEGER NOT NULL
 );
 
