@@ -255,12 +255,12 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleEmbedSubtitlesExtraction(embedTarget, url.origin, userAgent);
   }
 
-async function ensureDbSchema(db) {
-  if (!db) return;
-  try { await db.prepare("ALTER TABLE users ADD COLUMN username TEXT").run(); } catch (e) {}
-  try { await db.prepare("ALTER TABLE users ADD COLUMN avatar_url TEXT").run(); } catch (e) {}
-  try { await db.prepare("ALTER TABLE users ADD COLUMN bio TEXT").run(); } catch (e) {}
-}
+  async function ensureDbSchema(db) {
+    if (!db) return;
+    try { await db.prepare("ALTER TABLE users ADD COLUMN username TEXT").run(); } catch (e) { }
+    try { await db.prepare("ALTER TABLE users ADD COLUMN avatar_url TEXT").run(); } catch (e) { }
+    try { await db.prepare("ALTER TABLE users ADD COLUMN bio TEXT").run(); } catch (e) { }
+  }
 
   // 1.5 D1 AUTH, PROFILE & CLOUD WATCH VAULT SYNC ENDPOINTS
   if ((normPath === "/api/auth/register" || queryAction === "register") && request.method === "POST") {
@@ -482,7 +482,7 @@ async function ensureDbSchema(db) {
               ? parsed.reduce((acc, it) => { if (it && it.id) acc[String(it.id)] = it; return acc; }, {})
               : parsed;
           }
-        } catch (e) {}
+        } catch (e) { }
       }
 
       function mergeCollection(target, source) {
@@ -1307,10 +1307,10 @@ async function handleScheduleRequest(url) {
     const dayIndex = new Date(timestamp * 1000).getUTCDay();
     const dayName = daysOfWeek[dayIndex];
 
-    const ajaxUrl = `https://anikototv.to/ajax/schedule/date?tz=0&time=${timestamp}`;
+    const ajaxUrl = `https://reanime.to/api/v1/schedule?tz=0&time=${timestamp}`;
     const headers = new Headers({
       'X-Requested-With': 'XMLHttpRequest',
-      'Referer': 'https://anikototv.to/home',
+      'Referer': 'https://reanime.to/home',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     });
 
