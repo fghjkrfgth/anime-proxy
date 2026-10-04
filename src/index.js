@@ -1307,7 +1307,7 @@ async function handleScheduleRequest(url) {
     const dayIndex = new Date(timestamp * 1000).getUTCDay();
     const dayName = daysOfWeek[dayIndex];
 
-    const ajaxUrl = `https://reanime.to/api/v1/schedule?tz=0&time=${timestamp}`;
+    const ajaxUrl = `https://reanime.to/api/v1/schedule`;
     const headers = new Headers({
       'X-Requested-With': 'XMLHttpRequest',
       'Referer': 'https://reanime.to/home',
