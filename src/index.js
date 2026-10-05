@@ -597,7 +597,12 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleServerListRequest(url);
   }
 
-  // 5. TRANSPARENT PROXY ENGINE (For .ts segments, sub-playlists, keys, fonts, subtitles)
+  // 5. PROGRESSIVE 10-SEGMENT BUNDLE ROUTER (/api/stream/bundle)
+  if (normPath === "/api/stream/bundle" || action === "bundle") {
+    return await handleBundleRequest(request, url, eventOrReq);
+  }
+
+  // 6. TRANSPARENT PROXY ENGINE (For .ts segments, sub-playlists, keys, fonts, subtitles)
   const srcUrl = url.searchParams.get("src");
   if (srcUrl && action !== "proxy_caption") {
     return await handleTransparentProxy(srcUrl, request, url);
@@ -981,6 +986,145 @@ async function handleFlixCloudStreamRequest(url, request) {
 }
 
 // -------------------------------------------------------------------------
+// PROGRESSIVE 10-SEGMENT PACKET BUNDLE STREAMER (WITH SUB-SLICE SEEKING)
+// -------------------------------------------------------------------------
+async function handleBundleRequest(request, url, eventOrReq) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+        "Access-Control-Max-Age": "86400",
+      },
+    });
+  }
+
+  const rawSegs = url.searchParams.get("segs");
+  if (!rawSegs) {
+    return new Response(JSON.stringify({ error: "Missing segs parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  let segmentUrls = [];
+  try {
+    segmentUrls = JSON.parse(rawSegs);
+    if (!Array.isArray(segmentUrls)) {
+      segmentUrls = [];
+    }
+  } catch (e) {
+    return new Response(JSON.stringify({ error: "Invalid segs parameter, expected JSON array" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const startSegParam = url.searchParams.get("start_seg");
+  let startSeg = 0;
+  if (startSegParam !== null && startSegParam !== undefined) {
+    const parsedStart = parseInt(startSegParam, 10);
+    if (!isNaN(parsedStart) && parsedStart >= 0) {
+      startSeg = parsedStart;
+    }
+  }
+
+  // Handle In-Batch Seeking (start_seg):
+  // If start_seg is provided (e.g., start_seg=7), slice the segment array starting at that index
+  // so the Worker skips preceding segments (0–6) and immediately begins downloading segment 7.
+  let filteredSegments = segmentUrls;
+  if (startSeg > 0 && segmentUrls.length > 0) {
+    const validStart = Math.min(startSeg, segmentUrls.length - 1);
+    filteredSegments = segmentUrls.slice(validStart);
+  }
+
+  if (request.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp2t",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+        "Cache-Control": "public, max-age=31536000, immutable",
+      },
+    });
+  }
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+
+  const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+  const fetchHeaders = new Headers({
+    "User-Agent": userAgent,
+    "Referer": "https://flixcloud.cc/",
+    "Origin": "https://flixcloud.cc",
+    "Accept": "*/*",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+  });
+
+  const streamProcess = (async () => {
+    try {
+      for (const segUrl of filteredSegments) {
+        if (request.signal && request.signal.aborted) {
+          break;
+        }
+
+        const upstreamResponse = await fetch(segUrl, {
+          method: "GET",
+          headers: fetchHeaders,
+          signal: request.signal,
+        });
+
+        if (!upstreamResponse.ok || !upstreamResponse.body) {
+          console.warn(`[Bundle Streamer] Upstream failed for ${segUrl}: ${upstreamResponse.status}`);
+          continue;
+        }
+
+        if (request.signal && request.signal.aborted) {
+          break;
+        }
+
+        await upstreamResponse.body.pipeTo(
+          new WritableStream({
+            write(chunk) {
+              return writer.write(chunk);
+            }
+          }),
+          { preventClose: true }
+        );
+      }
+    } catch (err) {
+      console.warn("[Bundle Streamer] Streaming interrupted or client aborted:", err?.message || err);
+    } finally {
+      try {
+        await writer.close();
+      } catch (_) {}
+    }
+  })();
+
+  if (eventOrReq && typeof eventOrReq.waitUntil === "function") {
+    eventOrReq.waitUntil(streamProcess);
+  }
+
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      "Content-Type": "video/mp2t",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+
+// -------------------------------------------------------------------------
 // TRANSPARENT PROXY ENGINE (WITH FLIXCLOUD REFERER & RANGE FORWARDING)
 // -------------------------------------------------------------------------
 async function handleTransparentProxy(srcUrl, request, workerUrl) {
@@ -1238,51 +1382,180 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   };
 
   const lines = sanitizedText.split(/\r?\n/);
-  const rewrittenLines = [];
+
+  // 1. Differentiate between Master Playlists (#EXT-X-STREAM-INF) and Media Segment Playlists (#EXTINF)
+  const isMasterPlaylist = sanitizedText.includes('#EXT-X-STREAM-INF');
+
+  // Master Playlists: Continue rewriting child variant URLs and #EXT-X-MEDIA URIs through the proxy transparently.
+  if (isMasterPlaylist) {
+    const rewrittenLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (!trimmed) {
+        if (rewrittenLines.length > 0) rewrittenLines.push('');
+        continue;
+      }
+
+      if (trimmed.startsWith('#')) {
+        if (/URI=/i.test(trimmed)) {
+          const tagRewritten = trimmed.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
+            if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
+              return `URI="${uri}"`;
+            }
+            const absUrl = resolveTargetUri(uri);
+            const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
+            return `URI="${proxiedUrl}"`;
+          });
+          rewrittenLines.push(tagRewritten);
+          continue;
+        }
+        rewrittenLines.push(trimmed);
+        continue;
+      }
+
+      // Child variant playlist URL line
+      if ((cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) || trimmed.startsWith('/?src=')) {
+        rewrittenLines.push(trimmed);
+        continue;
+      }
+
+      const absVariantUrl = resolveTargetUri(trimmed);
+      rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absVariantUrl)}`);
+    }
+
+    while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
+      rewrittenLines.shift();
+    }
+    if (rewrittenLines.length === 0 || !rewrittenLines[0].startsWith('#EXTM3U')) {
+      rewrittenLines.unshift('#EXTM3U');
+    }
+    return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
+  }
+
+  // 2. Media Playlists: Group consecutive #EXTINF segment tags into 10-segment packet batches.
+  // Preserve all header tags (#EXTM3U, #EXT-X-VERSION, #EXT-X-TARGETDURATION, #EXT-X-KEY, #EXT-X-PLAYLIST-TYPE, #EXT-X-ENDLIST)
+  const headerLines = [];
+  const segments = [];
+  let hasEndList = false;
+
+  let currentExtinf = null;
+  let currentDuration = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (!trimmed) {
-      if (rewrittenLines.length > 0) rewrittenLines.push('');
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('#EXTINF:')) {
+      currentExtinf = trimmed;
+      const durationMatch = trimmed.match(/^#EXTINF:\s*([0-9.]+)/i);
+      currentDuration = durationMatch ? parseFloat(durationMatch[1]) : 0;
+      continue;
+    }
+
+    if (currentExtinf) {
+      if (trimmed.startsWith('#')) {
+        // Tag immediately after EXTINF
+        continue;
+      }
+      // Segment URL line
+      const absSegUrl = resolveTargetUri(trimmed);
+      segments.push({
+        duration: currentDuration,
+        url: absSegUrl,
+      });
+      currentExtinf = null;
+      currentDuration = 0;
+      continue;
+    }
+
+    if (trimmed === '#EXT-X-ENDLIST') {
+      hasEndList = true;
       continue;
     }
 
     if (trimmed.startsWith('#')) {
+      // Preserve #EXT-X-KEY tag and rewrite URI to proxy so key.bin is handled transparently
       if (/URI=/i.test(trimmed)) {
         const tagRewritten = trimmed.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
           if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
             return `URI="${uri}"`;
           }
           const absUrl = resolveTargetUri(uri);
-          const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
-          return `URI="${proxiedUrl}"`;
+          return `URI="${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}"`;
         });
-        rewrittenLines.push(tagRewritten);
+        headerLines.push(tagRewritten);
         continue;
       }
-      rewrittenLines.push(trimmed);
+      headerLines.push(trimmed);
       continue;
     }
+  }
 
-    // Segment URL line
-    if ((cleanWorkerOrigin && trimmed.startsWith(cleanWorkerOrigin)) || trimmed.startsWith('/?src=')) {
-      rewrittenLines.push(trimmed);
-      continue;
+  // If no segments found, return sanitized manifest
+  if (segments.length === 0) {
+    return sanitizedText;
+  }
+
+  // Playlist Batch Packaging Algorithm:
+  // Iterate through segment entries. Every 10 segments (or final remainder block),
+  // calculate cumulative #EXTINF duration by summing each segment's exact floating-point duration.
+  const BATCH_SIZE = 10;
+  const bundledLines = [];
+  let batchIdx = 0;
+  let maxBatchDuration = 0;
+
+  for (let i = 0; i < segments.length; i += BATCH_SIZE) {
+    const batchSegments = segments.slice(i, i + BATCH_SIZE);
+    const batchSegmentUrls = batchSegments.map(s => s.url);
+    const cumulativeDuration = batchSegments.reduce((sum, s) => sum + s.duration, 0);
+    const exactDuration = parseFloat(cumulativeDuration.toFixed(6));
+    if (exactDuration > maxBatchDuration) {
+      maxBatchDuration = exactDuration;
     }
 
-    const absSegmentUrl = resolveTargetUri(trimmed);
-    rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absSegmentUrl)}`);
+    const bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&segs=${encodeURIComponent(JSON.stringify(batchSegmentUrls))}`;
+
+    bundledLines.push(`#EXTINF:${exactDuration},`);
+    bundledLines.push(bundleUrl);
+    batchIdx++;
   }
 
-  while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
-    rewrittenLines.shift();
-  }
-  if (rewrittenLines.length === 0 || !rewrittenLines[0].startsWith('#EXTM3U')) {
-    rewrittenLines.unshift('#EXTM3U');
+  // Preserve #EXT-X-TARGETDURATION, ensuring value is at least the max batch duration
+  let hasTargetDuration = false;
+  const processedHeaderLines = headerLines.map(hl => {
+    if (hl.startsWith('#EXT-X-TARGETDURATION:')) {
+      hasTargetDuration = true;
+      const origDurMatch = hl.match(/^#EXT-X-TARGETDURATION:\s*(\d+)/i);
+      const origDur = origDurMatch ? parseInt(origDurMatch[1], 10) : 0;
+      const targetDur = Math.max(origDur, Math.ceil(maxBatchDuration));
+      return `#EXT-X-TARGETDURATION:${targetDur}`;
+    }
+    return hl;
+  });
+
+  if (!hasTargetDuration && maxBatchDuration > 0) {
+    processedHeaderLines.push(`#EXT-X-TARGETDURATION:${Math.ceil(maxBatchDuration)}`);
   }
 
-  return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
+  const outputLines = [
+    ...processedHeaderLines,
+    ...bundledLines,
+  ];
+
+  if (hasEndList) {
+    outputLines.push('#EXT-X-ENDLIST');
+  }
+
+  while (outputLines.length > 0 && !outputLines[0].trim()) {
+    outputLines.shift();
+  }
+  if (outputLines.length === 0 || !outputLines[0].startsWith('#EXTM3U')) {
+    outputLines.unshift('#EXTM3U');
+  }
+
+  return outputLines.join('\n').replace(/^\uFEFF/, '').trimStart();
 }
 
 // -------------------------------------------------------------------------
@@ -1307,7 +1580,7 @@ async function handleScheduleRequest(url) {
     const dayIndex = new Date(timestamp * 1000).getUTCDay();
     const dayName = daysOfWeek[dayIndex];
 
-    const ajaxUrl = `https://reanime.to/api/v1/schedule`;
+    const ajaxUrl = `https://reanime.to/api/v1/schedule?tz=0&time=${timestamp}`;
     const headers = new Headers({
       'X-Requested-With': 'XMLHttpRequest',
       'Referer': 'https://reanime.to/home',
