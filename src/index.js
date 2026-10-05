@@ -1006,28 +1006,34 @@ async function getAesCryptoKey(keyUri) {
     return aesKeyCache.get(keyUri);
   }
 
-  // Extract actual upstream target if keyUri is wrapped in proxy param (?src= or ?url=)
-  let fetchTarget = keyUri;
-  try {
-    if (keyUri.includes("src=") || keyUri.includes("url=")) {
-      const qIdx = keyUri.indexOf("?");
+  // Unwrap nested proxy key URLs (e.g. ?src= or ?url=)
+  let targetKeyUrl = keyUri;
+  while (targetKeyUrl && (targetKeyUrl.includes("src=") || targetKeyUrl.includes("url="))) {
+    try {
+      const qIdx = targetKeyUrl.indexOf("?");
       if (qIdx !== -1) {
-        const params = new URLSearchParams(keyUri.slice(qIdx + 1));
-        const srcParam = params.get("src") || params.get("url");
-        if (srcParam) {
-          fetchTarget = srcParam;
+        const params = new URLSearchParams(targetKeyUrl.slice(qIdx + 1));
+        const inner = params.get("src") || params.get("url");
+        if (inner && inner !== targetKeyUrl) {
+          targetKeyUrl = inner;
+        } else {
+          break;
         }
+      } else {
+        break;
       }
+    } catch (_) {
+      break;
     }
-  } catch (_) {}
-
-  // If fetchTarget is relative, resolve against flixcloud.cc
-  if (fetchTarget.startsWith("/")) {
-    fetchTarget = "https://flixcloud.cc" + fetchTarget;
   }
 
-  if (aesKeyCache.has(fetchTarget)) {
-    const key = aesKeyCache.get(fetchTarget);
+  // If targetKeyUrl is relative, resolve against flixcloud.cc
+  if (targetKeyUrl.startsWith("/")) {
+    targetKeyUrl = "https://flixcloud.cc" + targetKeyUrl;
+  }
+
+  if (aesKeyCache.has(targetKeyUrl)) {
+    const key = aesKeyCache.get(targetKeyUrl);
     aesKeyCache.set(keyUri, key);
     return key;
   }
@@ -1038,7 +1044,7 @@ async function getAesCryptoKey(keyUri) {
     try {
       if (typeof caches !== "undefined" && caches.default) {
         cache = caches.default;
-        const cachedRes = await cache.match(fetchTarget);
+        const cachedRes = await cache.match(targetKeyUrl);
         if (cachedRes) {
           keyBuf = await cachedRes.arrayBuffer();
         }
@@ -1046,35 +1052,33 @@ async function getAesCryptoKey(keyUri) {
     } catch (_) {}
 
     if (!keyBuf) {
-      let referer = "https://flixcloud.cc/";
-      let origin = "https://flixcloud.cc";
-      try {
-        const u = new URL(fetchTarget);
-        referer = `${u.origin}/`;
-        origin = u.origin;
-      } catch (_) {}
-
-      const res = await fetch(fetchTarget, {
+      const res = await fetch(targetKeyUrl, {
         headers: {
           "Referer": "https://flixcloud.cc/",
           "Origin": "https://flixcloud.cc",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+          "Accept": "*/*",
+          "Sec-Fetch-Dest": "empty",
+          "Sec-Fetch-Mode": "cors",
+          "Sec-Fetch-Site": "cross-site"
         }
       });
-      if (!res.ok) {
-        console.error(`[AES Key Fetch] Failed to fetch key (${res.status}) from ${fetchTarget}`);
+
+      if (res.status !== 200) {
+        console.error("[AES Key Fetch Failed]", res.status, targetKeyUrl);
         return null;
       }
+
       if (cache && typeof cache.put === "function") {
         try {
-          await cache.put(fetchTarget, res.clone());
+          await cache.put(targetKeyUrl, res.clone());
         } catch (_) {}
       }
       keyBuf = await res.arrayBuffer();
     }
 
     if (!keyBuf || keyBuf.byteLength !== 16) {
-      console.error(`[AES Key Fetch] Invalid key byteLength (${keyBuf ? keyBuf.byteLength : 0}), expected 16 from ${fetchTarget}`);
+      console.error(`[AES Key Fetch] Invalid key byteLength (${keyBuf ? keyBuf.byteLength : 0}), expected 16 from ${targetKeyUrl}`);
       return null;
     }
 
@@ -1087,46 +1091,38 @@ async function getAesCryptoKey(keyUri) {
     );
 
     aesKeyCache.set(keyUri, cryptoKey);
-    aesKeyCache.set(fetchTarget, cryptoKey);
+    aesKeyCache.set(targetKeyUrl, cryptoKey);
     return cryptoKey;
   } catch (err) {
-    console.error(`[AES Key Fetch] Error fetching/importing key from ${fetchTarget}:`, err);
+    console.error(`[AES Key Fetch] Error fetching/importing key from ${targetKeyUrl}:`, err);
     return null;
   }
 }
 
 /**
  * Compute the 16-byte Initialization Vector (IV) for a specific segment.
- * RFC 8216: If explicit IV is omitted, IV is the 16-byte big-endian sequence number in bytes 12-15.
- * If explicit IV is specified, sequence offset is added to the lower 32 bits (bytes 12-15) with carry.
+ * RFC 8216: If explicit IV is omitted, IV is the 16-byte big-endian sequence number.
+ * If explicit IV is specified, sequence offset is added to lower 32 bits (bytes 12-15) with carry.
  */
 function getSegmentIv(baseIvHex, seqNum) {
   const iv = new Uint8Array(16);
-  const seq = (Number(seqNum) || 0) >>> 0;
-
-  if (baseIvHex && typeof baseIvHex === "string" && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
-    const rawBytes = hexToBytes(baseIvHex);
-    const copyLen = Math.min(rawBytes.length, 16);
-    const offset = 16 - copyLen;
-    for (let i = 0; i < copyLen; i++) {
-      iv[offset + i] = rawBytes[i];
+  if (baseIvHex && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
+    const clean = baseIvHex.slice(2).padStart(32, "0");
+    for (let i = 0; i < 16; i++) {
+      iv[i] = parseInt(clean.substr(i * 2, 2), 16) || 0;
     }
-
-    // Add sequence offset to lower 32 bits (bytes 12-15) using standard byte addition with carry
-    let carry = seq;
+    // Add sequence number to lower 32 bits (bytes 12-15) with carry
+    let carry = seqNum >>> 0;
     for (let i = 15; i >= 12; i--) {
       const sum = iv[i] + (carry & 0xff);
       iv[i] = sum & 0xff;
-      carry = (sum >> 8) + (carry >>> 8);
+      carry = (carry >>> 8) + (sum >>> 8);
     }
-    return iv;
+  } else {
+    // RFC 8216: 16-byte big-endian sequence number
+    const view = new DataView(iv.buffer);
+    view.setUint32(12, seqNum >>> 0);
   }
-
-  // RFC 8216: Sequence number formatted as 16-octet big-endian integer into bytes 12-15
-  iv[12] = (seq >>> 24) & 0xff;
-  iv[13] = (seq >>> 16) & 0xff;
-  iv[14] = (seq >>> 8) & 0xff;
-  iv[15] = seq & 0xff;
   return iv;
 }
 
@@ -1211,17 +1207,15 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     targetSegments = segmentUrls.slice(validStart);
   }
 
-  // Pre-resolve AES key if key_url is specified:
-  // Abort and return explicit HTTP 502 if key fetching fails to prevent piping raw cipher bytes
   let cryptoKey = null;
   if (keyUrl) {
-    cryptoKey = await getAesCryptoKey(keyUrl);
-    if (!cryptoKey) {
-      console.error(`[Bundle Worker] Failed to resolve AES-128 key from ${keyUrl}`);
-      return jsonResponse({
-        error: "Failed to resolve or decrypt AES-128 key for bundled stream",
-        key_url: keyUrl
-      }, 502);
+    try {
+      cryptoKey = await getAesCryptoKey(keyUrl);
+      if (!cryptoKey) {
+        console.warn(`[Bundle Worker] Key resolution returned null for ${keyUrl} - falling back to raw MPEG-TS detection`);
+      }
+    } catch (kErr) {
+      console.warn(`[Bundle Worker] Key fetch exception for ${keyUrl}:`, kErr);
     }
   }
 
@@ -1268,18 +1262,32 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
         const segUrl = targetSegments[k];
         const currentSeq = startSeq + startSeg + k;
 
-        const res = await fetch(segUrl, {
-          headers: fetchHeaders,
-          signal: request.signal
-        });
-
-        if (!res.ok) {
-          console.warn(`[Bundle Worker] Segment fetch failed: ${res.status} for ${segUrl}`);
+        let res;
+        try {
+          res = await fetch(segUrl, {
+            headers: fetchHeaders,
+            signal: request.signal
+          });
+        } catch (fetchErr) {
+          console.warn(`[Bundle Worker] Network error fetching ${segUrl}:`, fetchErr?.message || fetchErr);
           continue;
         }
 
-        if (cryptoKey) {
-          const encBuffer = await res.arrayBuffer();
+        if (!res.ok) {
+          console.warn(`[Bundle Worker] Segment fetch failed (${res.status}): ${segUrl}`);
+          continue;
+        }
+
+        const encBuffer = await res.arrayBuffer();
+        if (!encBuffer || encBuffer.byteLength < 16) {
+          console.warn(`[Bundle Worker] Segment too small (${encBuffer ? encBuffer.byteLength : 0} bytes): ${segUrl}`);
+          continue;
+        }
+
+        const rawBytes = new Uint8Array(encBuffer);
+        const isRawTs = rawBytes[0] === 0x47;
+
+        if (cryptoKey && !isRawTs) {
           try {
             const segmentIv = getSegmentIv(baseIv, currentSeq);
             const decryptedBuf = await crypto.subtle.decrypt(
@@ -1289,26 +1297,20 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
             );
             await writer.write(new Uint8Array(decryptedBuf));
           } catch (decryptErr) {
-            console.warn(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
-            const rawBytes = new Uint8Array(encBuffer);
+            console.error(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
+            const hexHead = Array.from(rawBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
+            console.warn(`[Bundle Worker] Raw buffer size: ${encBuffer.byteLength}, first 16 bytes: ${hexHead}`);
             if (rawBytes[0] === 0x47) {
               await writer.write(rawBytes);
             }
           }
         } else {
-          // Unencrypted stream: pump directly via reader
-          if (!res.body) continue;
-          const reader = res.body.getReader();
-          try {
-            while (true) {
-              if (request.signal && request.signal.aborted) break;
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (value) await writer.write(value);
-            }
-          } finally {
-            reader.releaseLock();
+          // If raw TS or cryptoKey unavailable, write raw buffer directly
+          if (!cryptoKey && !isRawTs) {
+            const hexHead = Array.from(rawBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
+            console.warn(`[Bundle Worker] cryptoKey unavailable and not raw TS (seq ${currentSeq}), first 16 bytes: ${hexHead}`);
           }
+          await writer.write(rawBytes);
         }
       }
     } catch (err) {
