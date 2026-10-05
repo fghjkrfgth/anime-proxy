@@ -249,6 +249,14 @@ async function handleRequest(eventOrReq, envParam) {
   // Client User-Agent
   let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
+  // =========================================================================
+  // 1. HIGH-PRIORITY PROGRESSIVE 10-SEGMENT BUNDLE ROUTER (/api/stream/bundle)
+  // Must execute BEFORE any proxy or generic stream parameter matching
+  // =========================================================================
+  if (normPath === "/api/stream/bundle" || queryAction === "bundle" || action === "bundle") {
+    return await handleBundleRequest(url, request, eventOrReq);
+  }
+
   // ROUTE: Direct Embed Subtitle Scraper (/api/embed-subtitles or ?action=embed_subtitles)
   if (normPath === "/api/embed-subtitles" || queryAction === "embed_subtitles") {
     const embedTarget = url.searchParams.get("url") || url.searchParams.get("id");
@@ -597,12 +605,7 @@ async function handleRequest(eventOrReq, envParam) {
     return await handleServerListRequest(url);
   }
 
-  // 5. PROGRESSIVE 10-SEGMENT BUNDLE ROUTER (/api/stream/bundle)
-  if (normPath === "/api/stream/bundle" || action === "bundle") {
-    return await handleBundleRequest(request, url, eventOrReq);
-  }
-
-  // 6. TRANSPARENT PROXY ENGINE (For .ts segments, sub-playlists, keys, fonts, subtitles)
+  // 5. TRANSPARENT PROXY ENGINE (For .ts segments, sub-playlists, keys, fonts, subtitles)
   const srcUrl = url.searchParams.get("src");
   if (srcUrl && action !== "proxy_caption") {
     return await handleTransparentProxy(srcUrl, request, url);
@@ -988,7 +991,16 @@ async function handleFlixCloudStreamRequest(url, request) {
 // -------------------------------------------------------------------------
 // PROGRESSIVE 10-SEGMENT PACKET BUNDLE STREAMER (WITH SUB-SLICE SEEKING)
 // -------------------------------------------------------------------------
-async function handleBundleRequest(request, url, eventOrReq) {
+async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
+  let url, request;
+  if (urlOrReq instanceof URL || (urlOrReq && urlOrReq.searchParams)) {
+    url = urlOrReq;
+    request = reqOrUrl;
+  } else {
+    request = urlOrReq;
+    url = reqOrUrl;
+  }
+
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -1002,25 +1014,31 @@ async function handleBundleRequest(request, url, eventOrReq) {
     });
   }
 
+  const prefix = url.searchParams.get("prefix") || url.searchParams.get("base") || "";
   const rawSegs = url.searchParams.get("segs");
-  if (!rawSegs) {
-    return new Response(JSON.stringify({ error: "Missing segs parameter" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-    });
+  let segmentUrls = [];
+
+  if (rawSegs) {
+    if (rawSegs.startsWith("[")) {
+      try {
+        segmentUrls = JSON.parse(rawSegs);
+      } catch (e) {
+        segmentUrls = [];
+      }
+    } else {
+      const delimiter = rawSegs.includes("|") ? "|" : ",";
+      const parts = rawSegs.split(delimiter).map(s => s.trim()).filter(Boolean);
+      if (prefix) {
+        segmentUrls = parts.map(p => (/^https?:\/\//i.test(p) ? p : prefix + p));
+      } else {
+        segmentUrls = parts;
+      }
+    }
   }
 
-  let segmentUrls = [];
-  try {
-    segmentUrls = JSON.parse(rawSegs);
-    if (!Array.isArray(segmentUrls)) {
-      segmentUrls = [];
-    }
-  } catch (e) {
-    return new Response(JSON.stringify({ error: "Invalid segs parameter, expected JSON array" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-    });
+  // Top-level validation: Guard against empty segment payloads
+  if (!segmentUrls || segmentUrls.length === 0) {
+    return jsonResponse({ error: "No segments supplied to bundle" }, 400);
   }
 
   const startSegParam = url.searchParams.get("start_seg");
@@ -1035,10 +1053,10 @@ async function handleBundleRequest(request, url, eventOrReq) {
   // Handle In-Batch Seeking (start_seg):
   // If start_seg is provided (e.g., start_seg=7), slice the segment array starting at that index
   // so the Worker skips preceding segments (0–6) and immediately begins downloading segment 7.
-  let filteredSegments = segmentUrls;
+  let targetSegments = segmentUrls;
   if (startSeg > 0 && segmentUrls.length > 0) {
     const validStart = Math.min(startSeg, segmentUrls.length - 1);
-    filteredSegments = segmentUrls.slice(validStart);
+    targetSegments = segmentUrls.slice(validStart);
   }
 
   if (request.method === "HEAD") {
@@ -1058,58 +1076,54 @@ async function handleBundleRequest(request, url, eventOrReq) {
   const writer = writable.getWriter();
 
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-  const fetchHeaders = new Headers({
+  const fetchHeaders = {
     "User-Agent": userAgent,
     "Referer": "https://flixcloud.cc/",
-    "Origin": "https://flixcloud.cc",
-    "Accept": "*/*",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-  });
+    "Origin": "https://flixcloud.cc"
+  };
 
-  const streamProcess = (async () => {
+  // Launch async stream task using manual reader pumping with a clean try...finally
+  // block to guarantee writer.close() is ALWAYS reached and prevent deadlocks
+  const streamTask = (async () => {
     try {
-      for (const segUrl of filteredSegments) {
+      for (const segUrl of targetSegments) {
         if (request.signal && request.signal.aborted) {
           break;
         }
 
-        const upstreamResponse = await fetch(segUrl, {
-          method: "GET",
+        const res = await fetch(segUrl, {
           headers: fetchHeaders,
-          signal: request.signal,
+          signal: request.signal
         });
 
-        if (!upstreamResponse.ok || !upstreamResponse.body) {
-          console.warn(`[Bundle Streamer] Upstream failed for ${segUrl}: ${upstreamResponse.status}`);
+        if (!res.ok || !res.body) {
+          console.warn(`[Bundle Worker] Segment fetch failed: ${res.status} for ${segUrl}`);
           continue;
         }
 
-        if (request.signal && request.signal.aborted) {
-          break;
-        }
-
-        await upstreamResponse.body.pipeTo(
-          new WritableStream({
-            write(chunk) {
-              return writer.write(chunk);
+        const reader = res.body.getReader();
+        try {
+          while (true) {
+            if (request.signal && request.signal.aborted) {
+              break;
             }
-          }),
-          { preventClose: true }
-        );
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) await writer.write(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
       }
     } catch (err) {
-      console.warn("[Bundle Streamer] Streaming interrupted or client aborted:", err?.message || err);
+      console.error("[Bundle Worker] Piping error:", err);
     } finally {
-      try {
-        await writer.close();
-      } catch (_) {}
+      await writer.close().catch(() => {});
     }
   })();
 
   if (eventOrReq && typeof eventOrReq.waitUntil === "function") {
-    eventOrReq.waitUntil(streamProcess);
+    eventOrReq.waitUntil(streamTask);
   }
 
   return new Response(readable, {
@@ -1118,9 +1132,10 @@ async function handleBundleRequest(request, url, eventOrReq) {
       "Content-Type": "video/mp2t",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-      "Cache-Control": "public, max-age=31536000, immutable",
-    },
+      "Cache-Control": "public, max-age=31536000, immutable"
+    }
   });
 }
 
@@ -1346,6 +1361,41 @@ async function handleEmbedSubtitlesExtraction(embedTarget, workerOrigin, userAge
   }
 }
 
+function extractCommonPrefixAndSuffixes(urls) {
+  if (!urls || urls.length === 0) return { prefix: '', suffixes: [] };
+  if (urls.length === 1) {
+    const lastSlash = urls[0].lastIndexOf('/');
+    if (lastSlash !== -1 && lastSlash > 8) {
+      return { prefix: urls[0].slice(0, lastSlash + 1), suffixes: [urls[0].slice(lastSlash + 1)] };
+    }
+    return { prefix: '', suffixes: urls };
+  }
+
+  let prefix = urls[0];
+  for (let i = 1; i < urls.length; i++) {
+    let j = 0;
+    while (j < prefix.length && j < urls[i].length && prefix[j] === urls[i][j]) {
+      j++;
+    }
+    prefix = prefix.slice(0, j);
+    if (!prefix) break;
+  }
+
+  const lastSlash = prefix.lastIndexOf('/');
+  if (lastSlash !== -1 && lastSlash > 8) {
+    const cleanPrefix = prefix.slice(0, lastSlash + 1);
+    const suffixes = urls.map(u => u.slice(cleanPrefix.length));
+    return { prefix: cleanPrefix, suffixes };
+  }
+
+  if (prefix && prefix.length > 8) {
+    const suffixes = urls.map(u => u.slice(prefix.length));
+    return { prefix, suffixes };
+  }
+
+  return { prefix: '', suffixes: urls };
+}
+
 // -------------------------------------------------------------------------
 // MANIFEST REWRITER (REWRITING SEGMENTS & TAG URIS TO PROXY)
 // -------------------------------------------------------------------------
@@ -1515,7 +1565,14 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       maxBatchDuration = exactDuration;
     }
 
-    const bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&segs=${encodeURIComponent(JSON.stringify(batchSegmentUrls))}`;
+    // Extract common prefix to keep URL compact and avoid Cloudflare 16KB URL limits
+    const { prefix, suffixes } = extractCommonPrefixAndSuffixes(batchSegmentUrls);
+    let bundleUrl;
+    if (prefix && prefix.length > 8) {
+      bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&prefix=${encodeURIComponent(prefix)}&segs=${encodeURIComponent(suffixes.join(','))}`;
+    } else {
+      bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
+    }
 
     bundledLines.push(`#EXTINF:${exactDuration},`);
     bundledLines.push(bundleUrl);
