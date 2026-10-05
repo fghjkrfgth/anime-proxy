@@ -18,9 +18,12 @@ function bytesToHex(bytes) {
 }
 
 function hexToBytes(hex) {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  if (!hex || typeof hex !== 'string') return new Uint8Array(0);
+  const cleanHex = hex.startsWith('0x') || hex.startsWith('0X') ? hex.slice(2) : hex;
+  const paddedHex = cleanHex.length % 2 !== 0 ? '0' + cleanHex : cleanHex;
+  const bytes = new Uint8Array(paddedHex.length / 2);
+  for (let i = 0; i < paddedHex.length; i += 2) {
+    bytes[i / 2] = parseInt(paddedHex.substr(i, 2), 16) || 0;
   }
   return bytes;
 }
@@ -1003,13 +1006,39 @@ async function getAesCryptoKey(keyUri) {
     return aesKeyCache.get(keyUri);
   }
 
+  // Extract actual upstream target if keyUri is wrapped in proxy param (?src= or ?url=)
+  let fetchTarget = keyUri;
+  try {
+    if (keyUri.includes("src=") || keyUri.includes("url=")) {
+      const qIdx = keyUri.indexOf("?");
+      if (qIdx !== -1) {
+        const params = new URLSearchParams(keyUri.slice(qIdx + 1));
+        const srcParam = params.get("src") || params.get("url");
+        if (srcParam) {
+          fetchTarget = srcParam;
+        }
+      }
+    }
+  } catch (_) {}
+
+  // If fetchTarget is relative, resolve against flixcloud.cc
+  if (fetchTarget.startsWith("/")) {
+    fetchTarget = "https://flixcloud.cc" + fetchTarget;
+  }
+
+  if (aesKeyCache.has(fetchTarget)) {
+    const key = aesKeyCache.get(fetchTarget);
+    aesKeyCache.set(keyUri, key);
+    return key;
+  }
+
   try {
     let keyBuf = null;
     let cache = null;
     try {
       if (typeof caches !== "undefined" && caches.default) {
         cache = caches.default;
-        const cachedRes = await cache.match(keyUri);
+        const cachedRes = await cache.match(fetchTarget);
         if (cachedRes) {
           keyBuf = await cachedRes.arrayBuffer();
         }
@@ -1020,32 +1049,33 @@ async function getAesCryptoKey(keyUri) {
       let referer = "https://flixcloud.cc/";
       let origin = "https://flixcloud.cc";
       try {
-        const u = new URL(keyUri);
+        const u = new URL(fetchTarget);
         referer = `${u.origin}/`;
         origin = u.origin;
       } catch (_) {}
 
-      const res = await fetch(keyUri, {
+      const res = await fetch(fetchTarget, {
         headers: {
-          "Referer": referer,
-          "Origin": origin,
+          "Referer": "https://flixcloud.cc/",
+          "Origin": "https://flixcloud.cc",
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         }
       });
       if (!res.ok) {
-        console.error(`[AES Key Fetch] Failed to fetch key (${res.status}) from ${keyUri}`);
+        console.error(`[AES Key Fetch] Failed to fetch key (${res.status}) from ${fetchTarget}`);
         return null;
       }
       if (cache && typeof cache.put === "function") {
         try {
-          await cache.put(keyUri, res.clone());
+          await cache.put(fetchTarget, res.clone());
         } catch (_) {}
       }
       keyBuf = await res.arrayBuffer();
     }
 
     if (!keyBuf || keyBuf.byteLength !== 16) {
-      console.warn(`[AES Key Fetch] Unexpected key byteLength: ${keyBuf ? keyBuf.byteLength : 0}`);
+      console.error(`[AES Key Fetch] Invalid key byteLength (${keyBuf ? keyBuf.byteLength : 0}), expected 16 from ${fetchTarget}`);
+      return null;
     }
 
     const cryptoKey = await crypto.subtle.importKey(
@@ -1057,44 +1087,46 @@ async function getAesCryptoKey(keyUri) {
     );
 
     aesKeyCache.set(keyUri, cryptoKey);
+    aesKeyCache.set(fetchTarget, cryptoKey);
     return cryptoKey;
   } catch (err) {
-    console.error(`[AES Key Fetch] Error fetching/importing key from ${keyUri}:`, err);
+    console.error(`[AES Key Fetch] Error fetching/importing key from ${fetchTarget}:`, err);
     return null;
   }
 }
 
 /**
- * Convert a hexadecimal IV string to a 16-byte Uint8Array.
- */
-function hexToBytes(hex) {
-  if (!hex || typeof hex !== "string") return new Uint8Array(16);
-  const cleanHex = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
-  const paddedHex = cleanHex.length % 2 !== 0 ? "0" + cleanHex : cleanHex;
-  const bytes = new Uint8Array(16);
-  const len = Math.min(paddedHex.length / 2, 16);
-  const offset = 16 - len;
-  for (let i = 0; i < len; i++) {
-    bytes[offset + i] = parseInt(paddedHex.substr(i * 2, 2), 16) || 0;
-  }
-  return bytes;
-}
-
-/**
  * Compute the 16-byte Initialization Vector (IV) for a specific segment.
- * RFC 8216: If explicit IV is omitted, IV is the 16-byte big-endian sequence number.
- * If explicit IV is specified, sequence offset is added to the lower 32 bits.
+ * RFC 8216: If explicit IV is omitted, IV is the 16-byte big-endian sequence number in bytes 12-15.
+ * If explicit IV is specified, sequence offset is added to the lower 32 bits (bytes 12-15) with carry.
  */
 function getSegmentIv(baseIvHex, seqNum) {
-  if (baseIvHex && typeof baseIvHex === "string" && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
-    const ivBytes = hexToBytes(baseIvHex);
-    const view = new DataView(ivBytes.buffer);
-    const low = (view.getUint32(12) + seqNum) >>> 0;
-    view.setUint32(12, low);
-    return ivBytes;
-  }
   const iv = new Uint8Array(16);
-  new DataView(iv.buffer).setUint32(12, seqNum >>> 0);
+  const seq = (Number(seqNum) || 0) >>> 0;
+
+  if (baseIvHex && typeof baseIvHex === "string" && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
+    const rawBytes = hexToBytes(baseIvHex);
+    const copyLen = Math.min(rawBytes.length, 16);
+    const offset = 16 - copyLen;
+    for (let i = 0; i < copyLen; i++) {
+      iv[offset + i] = rawBytes[i];
+    }
+
+    // Add sequence offset to lower 32 bits (bytes 12-15) using standard byte addition with carry
+    let carry = seq;
+    for (let i = 15; i >= 12; i--) {
+      const sum = iv[i] + (carry & 0xff);
+      iv[i] = sum & 0xff;
+      carry = (sum >> 8) + (carry >>> 8);
+    }
+    return iv;
+  }
+
+  // RFC 8216: Sequence number formatted as 16-octet big-endian integer into bytes 12-15
+  iv[12] = (seq >>> 24) & 0xff;
+  iv[13] = (seq >>> 16) & 0xff;
+  iv[14] = (seq >>> 8) & 0xff;
+  iv[15] = seq & 0xff;
   return iv;
 }
 
@@ -1179,6 +1211,20 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     targetSegments = segmentUrls.slice(validStart);
   }
 
+  // Pre-resolve AES key if key_url is specified:
+  // Abort and return explicit HTTP 502 if key fetching fails to prevent piping raw cipher bytes
+  let cryptoKey = null;
+  if (keyUrl) {
+    cryptoKey = await getAesCryptoKey(keyUrl);
+    if (!cryptoKey) {
+      console.error(`[Bundle Worker] Failed to resolve AES-128 key from ${keyUrl}`);
+      return jsonResponse({
+        error: "Failed to resolve or decrypt AES-128 key for bundled stream",
+        key_url: keyUrl
+      }, 502);
+    }
+  }
+
   if (request.method === "HEAD") {
     return new Response(null, {
       status: 200,
@@ -1214,11 +1260,6 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   // Writes unencrypted MPEG-TS chunks directly to the response writer
   const streamTask = (async () => {
     try {
-      let cryptoKey = null;
-      if (keyUrl) {
-        cryptoKey = await getAesCryptoKey(keyUrl);
-      }
-
       for (let k = 0; k < targetSegments.length; k++) {
         if (request.signal && request.signal.aborted) {
           break;
@@ -1252,8 +1293,6 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
             const rawBytes = new Uint8Array(encBuffer);
             if (rawBytes[0] === 0x47) {
               await writer.write(rawBytes);
-            } else {
-              throw decryptErr;
             }
           }
         } else {
@@ -1295,6 +1334,8 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     }
   });
 }
+
+// -------------------------------------------------------------------------
 
 // -------------------------------------------------------------------------
 // TRANSPARENT PROXY ENGINE (WITH FLIXCLOUD REFERER & RANGE FORWARDING)
@@ -1766,7 +1807,10 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}`;
 
     if (batchKeyUrl) {
-      bundleUrl += `&key_url=${encodeURIComponent(batchKeyUrl)}`;
+      const proxiedKeyUrl = (cleanWorkerOrigin && batchKeyUrl.startsWith(cleanWorkerOrigin))
+        ? batchKeyUrl
+        : `${cleanWorkerOrigin}/?src=${encodeURIComponent(batchKeyUrl)}`;
+      bundleUrl += `&key_url=${encodeURIComponent(proxiedKeyUrl)}`;
     }
     if (batchBaseIv) {
       bundleUrl += `&base_iv=${encodeURIComponent(batchBaseIv)}`;
