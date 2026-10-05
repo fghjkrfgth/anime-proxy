@@ -221,12 +221,13 @@ function parseLooseJson(str) {
 
 if (typeof addEventListener === "function") {
   addEventListener("fetch", (event) => {
-    event.respondWith(handleRequest(event));
+    event.respondWith(handleRequest(event, globalThis.env, event));
   });
 }
 
-async function handleRequest(eventOrReq, envParam) {
+async function handleRequest(eventOrReq, envParam, ctxParam) {
   const request = eventOrReq.request ? eventOrReq.request : eventOrReq;
+  const ctx = ctxParam || (typeof eventOrReq.waitUntil === "function" ? eventOrReq : null);
   const env = envParam || globalThis.env || {};
   const db = env?.DB || globalThis.DB;
   const url = new URL(request.url);
@@ -257,7 +258,7 @@ async function handleRequest(eventOrReq, envParam) {
   // Must execute BEFORE any proxy or generic stream parameter matching
   // =========================================================================
   if (normPath === "/api/stream/bundle" || queryAction === "bundle" || action === "bundle") {
-    return await handleBundleRequest(url, request, eventOrReq);
+    return await handleBundleRequest(url, request, ctx);
   }
 
   // ROUTE: Direct Embed Subtitle Scraper (/api/embed-subtitles or ?action=embed_subtitles)
@@ -1236,18 +1237,14 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   const writer = writable.getWriter();
 
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-  let fetchOrigin = "https://flixcloud.cc";
-  try {
-    if (targetSegments.length > 0) {
-      const u = new URL(targetSegments[0]);
-      fetchOrigin = u.origin;
-    }
-  } catch (_) {}
-
   const fetchHeaders = {
     "User-Agent": userAgent,
-    "Referer": `${fetchOrigin}/`,
-    "Origin": fetchOrigin
+    "Referer": "https://flixcloud.cc/",
+    "Origin": "https://flixcloud.cc",
+    "Accept": "*/*",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site"
   };
 
   // Launch async stream task with Web Crypto AES-128 decryption
@@ -1320,8 +1317,14 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     }
   })();
 
-  if (eventOrReq && typeof eventOrReq.waitUntil === "function") {
-    eventOrReq.waitUntil(streamTask);
+  const waitCtx = (eventOrReq && typeof eventOrReq.waitUntil === "function")
+    ? eventOrReq
+    : (request && typeof request.waitUntil === "function")
+    ? request
+    : null;
+
+  if (waitCtx) {
+    waitCtx.waitUntil(streamTask);
   }
 
   return new Response(readable, {
@@ -1809,10 +1812,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}`;
 
     if (batchKeyUrl) {
-      const proxiedKeyUrl = (cleanWorkerOrigin && batchKeyUrl.startsWith(cleanWorkerOrigin))
-        ? batchKeyUrl
-        : `${cleanWorkerOrigin}/?src=${encodeURIComponent(batchKeyUrl)}`;
-      bundleUrl += `&key_url=${encodeURIComponent(proxiedKeyUrl)}`;
+      bundleUrl += `&key_url=${encodeURIComponent(batchKeyUrl)}`;
     }
     if (batchBaseIv) {
       bundleUrl += `&base_iv=${encodeURIComponent(batchBaseIv)}`;
@@ -2143,6 +2143,6 @@ function formatSeasonsArray(arr) {
 
 export default {
   async fetch(request, env, ctx) {
-    return handleRequest(request, env);
+    return handleRequest(request, env, ctx);
   }
 };
