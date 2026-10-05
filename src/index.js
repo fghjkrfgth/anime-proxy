@@ -989,7 +989,117 @@ async function handleFlixCloudStreamRequest(url, request) {
 }
 
 // -------------------------------------------------------------------------
-// PROGRESSIVE 10-SEGMENT PACKET BUNDLE STREAMER (WITH SUB-SLICE SEEKING)
+// AES-128 DECRYPTION ENGINE & KEY CACHE FOR PACKET BUNDLES
+// -------------------------------------------------------------------------
+const aesKeyCache = new Map();
+
+/**
+ * Retrieve and import an AES-128 key using Web Crypto.
+ * Key is cached in-memory and in caches.default to prevent redundant upstream network calls.
+ */
+async function getAesCryptoKey(keyUri) {
+  if (!keyUri) return null;
+  if (aesKeyCache.has(keyUri)) {
+    return aesKeyCache.get(keyUri);
+  }
+
+  try {
+    let keyBuf = null;
+    let cache = null;
+    try {
+      if (typeof caches !== "undefined" && caches.default) {
+        cache = caches.default;
+        const cachedRes = await cache.match(keyUri);
+        if (cachedRes) {
+          keyBuf = await cachedRes.arrayBuffer();
+        }
+      }
+    } catch (_) {}
+
+    if (!keyBuf) {
+      let referer = "https://flixcloud.cc/";
+      let origin = "https://flixcloud.cc";
+      try {
+        const u = new URL(keyUri);
+        referer = `${u.origin}/`;
+        origin = u.origin;
+      } catch (_) {}
+
+      const res = await fetch(keyUri, {
+        headers: {
+          "Referer": referer,
+          "Origin": origin,
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        }
+      });
+      if (!res.ok) {
+        console.error(`[AES Key Fetch] Failed to fetch key (${res.status}) from ${keyUri}`);
+        return null;
+      }
+      if (cache && typeof cache.put === "function") {
+        try {
+          await cache.put(keyUri, res.clone());
+        } catch (_) {}
+      }
+      keyBuf = await res.arrayBuffer();
+    }
+
+    if (!keyBuf || keyBuf.byteLength !== 16) {
+      console.warn(`[AES Key Fetch] Unexpected key byteLength: ${keyBuf ? keyBuf.byteLength : 0}`);
+    }
+
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyBuf,
+      { name: "AES-CBC" },
+      false,
+      ["decrypt"]
+    );
+
+    aesKeyCache.set(keyUri, cryptoKey);
+    return cryptoKey;
+  } catch (err) {
+    console.error(`[AES Key Fetch] Error fetching/importing key from ${keyUri}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Convert a hexadecimal IV string to a 16-byte Uint8Array.
+ */
+function hexToBytes(hex) {
+  if (!hex || typeof hex !== "string") return new Uint8Array(16);
+  const cleanHex = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
+  const paddedHex = cleanHex.length % 2 !== 0 ? "0" + cleanHex : cleanHex;
+  const bytes = new Uint8Array(16);
+  const len = Math.min(paddedHex.length / 2, 16);
+  const offset = 16 - len;
+  for (let i = 0; i < len; i++) {
+    bytes[offset + i] = parseInt(paddedHex.substr(i * 2, 2), 16) || 0;
+  }
+  return bytes;
+}
+
+/**
+ * Compute the 16-byte Initialization Vector (IV) for a specific segment.
+ * RFC 8216: If explicit IV is omitted, IV is the 16-byte big-endian sequence number.
+ * If explicit IV is specified, sequence offset is added to the lower 32 bits.
+ */
+function getSegmentIv(baseIvHex, seqNum) {
+  if (baseIvHex && typeof baseIvHex === "string" && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
+    const ivBytes = hexToBytes(baseIvHex);
+    const view = new DataView(ivBytes.buffer);
+    const low = (view.getUint32(12) + seqNum) >>> 0;
+    view.setUint32(12, low);
+    return ivBytes;
+  }
+  const iv = new Uint8Array(16);
+  new DataView(iv.buffer).setUint32(12, seqNum >>> 0);
+  return iv;
+}
+
+// -------------------------------------------------------------------------
+// PROGRESSIVE 10-SEGMENT PACKET BUNDLE STREAMER (WITH IN-WORKER AES-128 DECRYPTION)
 // -------------------------------------------------------------------------
 async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   let url, request;
@@ -1041,6 +1151,17 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     return jsonResponse({ error: "No segments supplied to bundle" }, 400);
   }
 
+  const keyUrl = url.searchParams.get("key_url");
+  const baseIv = url.searchParams.get("base_iv");
+  const startSeqParam = url.searchParams.get("start_seq");
+  let startSeq = 0;
+  if (startSeqParam !== null && startSeqParam !== undefined) {
+    const parsedSeq = parseInt(startSeqParam, 10);
+    if (!isNaN(parsedSeq) && parsedSeq >= 0) {
+      startSeq = parsedSeq;
+    }
+  }
+
   const startSegParam = url.searchParams.get("start_seg");
   let startSeg = 0;
   if (startSegParam !== null && startSegParam !== undefined) {
@@ -1051,8 +1172,7 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   }
 
   // Handle In-Batch Seeking (start_seg):
-  // If start_seg is provided (e.g., start_seg=7), slice the segment array starting at that index
-  // so the Worker skips preceding segments (0–6) and immediately begins downloading segment 7.
+  // If start_seg is provided, slice segment array so preceding segments are skipped
   let targetSegments = segmentUrls;
   if (startSeg > 0 && segmentUrls.length > 0) {
     const validStart = Math.min(startSeg, segmentUrls.length - 1);
@@ -1076,43 +1196,80 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   const writer = writable.getWriter();
 
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+  let fetchOrigin = "https://flixcloud.cc";
+  try {
+    if (targetSegments.length > 0) {
+      const u = new URL(targetSegments[0]);
+      fetchOrigin = u.origin;
+    }
+  } catch (_) {}
+
   const fetchHeaders = {
     "User-Agent": userAgent,
-    "Referer": "https://flixcloud.cc/",
-    "Origin": "https://flixcloud.cc"
+    "Referer": `${fetchOrigin}/`,
+    "Origin": fetchOrigin
   };
 
-  // Launch async stream task using manual reader pumping with a clean try...finally
-  // block to guarantee writer.close() is ALWAYS reached and prevent deadlocks
+  // Launch async stream task with Web Crypto AES-128 decryption
+  // Writes unencrypted MPEG-TS chunks directly to the response writer
   const streamTask = (async () => {
     try {
-      for (const segUrl of targetSegments) {
+      let cryptoKey = null;
+      if (keyUrl) {
+        cryptoKey = await getAesCryptoKey(keyUrl);
+      }
+
+      for (let k = 0; k < targetSegments.length; k++) {
         if (request.signal && request.signal.aborted) {
           break;
         }
+
+        const segUrl = targetSegments[k];
+        const currentSeq = startSeq + startSeg + k;
 
         const res = await fetch(segUrl, {
           headers: fetchHeaders,
           signal: request.signal
         });
 
-        if (!res.ok || !res.body) {
+        if (!res.ok) {
           console.warn(`[Bundle Worker] Segment fetch failed: ${res.status} for ${segUrl}`);
           continue;
         }
 
-        const reader = res.body.getReader();
-        try {
-          while (true) {
-            if (request.signal && request.signal.aborted) {
-              break;
+        if (cryptoKey) {
+          const encBuffer = await res.arrayBuffer();
+          try {
+            const segmentIv = getSegmentIv(baseIv, currentSeq);
+            const decryptedBuf = await crypto.subtle.decrypt(
+              { name: "AES-CBC", iv: segmentIv },
+              cryptoKey,
+              encBuffer
+            );
+            await writer.write(new Uint8Array(decryptedBuf));
+          } catch (decryptErr) {
+            console.warn(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
+            const rawBytes = new Uint8Array(encBuffer);
+            if (rawBytes[0] === 0x47) {
+              await writer.write(rawBytes);
+            } else {
+              throw decryptErr;
             }
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) await writer.write(value);
           }
-        } finally {
-          reader.releaseLock();
+        } else {
+          // Unencrypted stream: pump directly via reader
+          if (!res.body) continue;
+          const reader = res.body.getReader();
+          try {
+            while (true) {
+              if (request.signal && request.signal.aborted) break;
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value) await writer.write(value);
+            }
+          } finally {
+            reader.releaseLock();
+          }
         }
       }
     } catch (err) {
@@ -1484,18 +1641,46 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   }
 
   // 2. Media Playlists: Group consecutive #EXTINF segment tags into 10-segment packet batches.
-  // Preserve all header tags (#EXTM3U, #EXT-X-VERSION, #EXT-X-TARGETDURATION, #EXT-X-KEY, #EXT-X-PLAYLIST-TYPE, #EXT-X-ENDLIST)
+  // Strip #EXT-X-KEY so Hls.js knows the incoming bundled stream is already decrypted.
   const headerLines = [];
   const segments = [];
   let hasEndList = false;
 
   let currentExtinf = null;
   let currentDuration = 0;
+  let mediaSequence = 0;
+  let activeKeyUrl = null;
+  let activeBaseIv = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
     if (!trimmed) continue;
+
+    if (trimmed.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      const seqMatch = trimmed.match(/^#EXT-X-MEDIA-SEQUENCE:\s*(\d+)/i);
+      if (seqMatch) {
+        mediaSequence = parseInt(seqMatch[1], 10);
+      }
+      headerLines.push(trimmed);
+      continue;
+    }
+
+    if (trimmed.startsWith('#EXT-X-KEY:')) {
+      // Parse active AES key and IV, but STRIP from headerLines so Hls.js does not attempt secondary decryption
+      if (/METHOD=AES-128/i.test(trimmed)) {
+        const uriMatch = trimmed.match(/URI=["']([^"']+)["']/i);
+        if (uriMatch) {
+          activeKeyUrl = resolveTargetUri(uriMatch[1]);
+        }
+        const ivMatch = trimmed.match(/IV=(0x[0-9a-fA-F]+)/i);
+        if (ivMatch) {
+          activeBaseIv = ivMatch[1];
+        }
+      }
+      // Note: Do NOT push #EXT-X-KEY to headerLines!
+      continue;
+    }
 
     if (trimmed.startsWith('#EXTINF:')) {
       currentExtinf = trimmed;
@@ -1514,6 +1699,8 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       segments.push({
         duration: currentDuration,
         url: absSegUrl,
+        keyUrl: activeKeyUrl,
+        baseIv: activeBaseIv
       });
       currentExtinf = null;
       currentDuration = 0;
@@ -1526,7 +1713,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     }
 
     if (trimmed.startsWith('#')) {
-      // Preserve #EXT-X-KEY tag and rewrite URI to proxy so key.bin is handled transparently
+      // Rewrite any non-key URI tags (e.g. #EXT-X-MAP) through proxy
       if (/URI=/i.test(trimmed)) {
         const tagRewritten = trimmed.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
           if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
@@ -1565,13 +1752,24 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       maxBatchDuration = exactDuration;
     }
 
+    const batchStartSeq = mediaSequence + i;
+    const batchKeyUrl = batchSegments[0].keyUrl || activeKeyUrl;
+    const batchBaseIv = batchSegments[0].baseIv || activeBaseIv;
+
     // Extract common prefix to keep URL compact and avoid Cloudflare 16KB URL limits
     const { prefix, suffixes } = extractCommonPrefixAndSuffixes(batchSegmentUrls);
     let bundleUrl;
-    if (prefix && prefix.length > 8) {
-      bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&prefix=${encodeURIComponent(prefix)}&segs=${encodeURIComponent(suffixes.join(','))}`;
-    } else {
-      bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
+    const segsParam = (prefix && prefix.length > 8)
+      ? `&prefix=${encodeURIComponent(prefix)}&segs=${encodeURIComponent(suffixes.join(','))}`
+      : `&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
+
+    bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}`;
+
+    if (batchKeyUrl) {
+      bundleUrl += `&key_url=${encodeURIComponent(batchKeyUrl)}`;
+    }
+    if (batchBaseIv) {
+      bundleUrl += `&base_iv=${encodeURIComponent(batchBaseIv)}`;
     }
 
     bundledLines.push(`#EXTINF:${exactDuration},`);
