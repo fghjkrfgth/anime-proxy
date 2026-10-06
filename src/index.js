@@ -1107,8 +1107,12 @@ async function getAesCryptoKey(keyUri) {
  */
 function getSegmentIv(baseIvHex, seqNum) {
   const iv = new Uint8Array(16);
-  if (baseIvHex && (baseIvHex.startsWith("0x") || baseIvHex.startsWith("0X"))) {
-    const clean = baseIvHex.slice(2).padStart(32, "0");
+  if (baseIvHex && typeof baseIvHex === "string" && baseIvHex.trim()) {
+    let clean = baseIvHex.trim();
+    if (clean.startsWith("0x") || clean.startsWith("0X")) {
+      clean = clean.slice(2);
+    }
+    clean = clean.padStart(32, "0");
     for (let i = 0; i < 16; i++) {
       iv[i] = parseInt(clean.substr(i * 2, 2), 16) || 0;
     }
@@ -1220,16 +1224,26 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     }
   }
 
+  // Audio vs Video stream detection for Content-Type
+  const isAudio = url.pathname.includes("/audio") ||
+                  url.searchParams.get("type") === "audio" ||
+                  (prefix && (prefix.includes("/audio/") || prefix.includes("_a0") || prefix.includes("-a0"))) ||
+                  (targetSegments.length > 0 && (targetSegments[0].includes("/audio/") || /-a\d+\./i.test(targetSegments[0]) || targetSegments[0].includes("audio")));
+  const contentType = isAudio ? "audio/mp2t" : "video/mp2t";
+
+  const bundleHeaders = {
+    "Content-Type": contentType,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+    "Cache-Control": "public, max-age=31536000, immutable"
+  };
+
   if (request.method === "HEAD") {
     return new Response(null, {
       status: 200,
-      headers: {
-        "Content-Type": "video/mp2t",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-        "Cache-Control": "public, max-age=31536000, immutable",
-      },
+      headers: bundleHeaders,
     });
   }
 
@@ -1241,14 +1255,11 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     "User-Agent": userAgent,
     "Referer": "https://flixcloud.cc/",
     "Origin": "https://flixcloud.cc",
-    "Accept": "*/*",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site"
+    "Accept": "*/*"
   };
 
   // Launch async stream task with Web Crypto AES-128 decryption
-  // Writes unencrypted MPEG-TS chunks directly to the response writer
+  // Writes each unencrypted MPEG-TS chunk immediately without buffering
   const streamTask = (async () => {
     try {
       for (let k = 0; k < targetSegments.length; k++) {
@@ -1266,8 +1277,15 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
             signal: request.signal
           });
         } catch (fetchErr) {
+          if (request.signal && request.signal.aborted) {
+            break;
+          }
           console.warn(`[Bundle Worker] Network error fetching ${segUrl}:`, fetchErr?.message || fetchErr);
           continue;
+        }
+
+        if (request.signal && request.signal.aborted) {
+          break;
         }
 
         if (!res.ok) {
@@ -1276,6 +1294,10 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
         }
 
         const encBuffer = await res.arrayBuffer();
+        if (request.signal && request.signal.aborted) {
+          break;
+        }
+
         if (!encBuffer || encBuffer.byteLength < 16) {
           console.warn(`[Bundle Worker] Segment too small (${encBuffer ? encBuffer.byteLength : 0} bytes): ${segUrl}`);
           continue;
@@ -1292,11 +1314,12 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
               cryptoKey,
               encBuffer
             );
+            if (request.signal && request.signal.aborted) {
+              break;
+            }
             await writer.write(new Uint8Array(decryptedBuf));
           } catch (decryptErr) {
             console.error(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
-            const hexHead = Array.from(rawBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
-            console.warn(`[Bundle Worker] Raw buffer size: ${encBuffer.byteLength}, first 16 bytes: ${hexHead}`);
             if (rawBytes[0] === 0x47) {
               await writer.write(rawBytes);
             }
@@ -1307,11 +1330,18 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
             const hexHead = Array.from(rawBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
             console.warn(`[Bundle Worker] cryptoKey unavailable and not raw TS (seq ${currentSeq}), first 16 bytes: ${hexHead}`);
           }
+          if (request.signal && request.signal.aborted) {
+            break;
+          }
           await writer.write(rawBytes);
         }
       }
     } catch (err) {
-      console.error("[Bundle Worker] Piping error:", err);
+      if (request.signal && request.signal.aborted) {
+        // Expected on seek / client abort
+      } else {
+        console.error("[Bundle Worker] Piping error:", err);
+      }
     } finally {
       await writer.close().catch(() => {});
     }
@@ -1329,14 +1359,7 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
 
   return new Response(readable, {
     status: 200,
-    headers: {
-      "Content-Type": "video/mp2t",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-      "Cache-Control": "public, max-age=31536000, immutable"
-    }
+    headers: bundleHeaders
   });
 }
 
@@ -1809,7 +1832,12 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       ? `&prefix=${encodeURIComponent(prefix)}&segs=${encodeURIComponent(suffixes.join(','))}`
       : `&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
 
-    bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}`;
+    const baseUrlStr = baseUrl ? (baseUrl.href || String(baseUrl)) : '';
+    const isAudioBatch = baseUrlStr.includes('/audio') ||
+                         batchSegmentUrls.some(u => typeof u === 'string' && (u.includes('/audio') || /-a\d+\./i.test(u)));
+    const audioParam = isAudioBatch ? '&type=audio' : '';
+
+    bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}${audioParam}`;
 
     if (batchKeyUrl) {
       bundleUrl += `&key_url=${encodeURIComponent(batchKeyUrl)}`;
