@@ -1224,11 +1224,11 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     }
   }
 
-  // Audio vs Video stream detection for Content-Type
-  const isAudio = url.pathname.includes("/audio") ||
-                  url.searchParams.get("type") === "audio" ||
-                  (prefix && (prefix.includes("/audio/") || prefix.includes("_a0") || prefix.includes("-a0"))) ||
-                  (targetSegments.length > 0 && (targetSegments[0].includes("/audio/") || /-a\d+\./i.test(targetSegments[0]) || targetSegments[0].includes("audio")));
+  // Audio vs Video stream detection for Content-Type (strictly match type=audio or /audio/)
+  const isAudio = url.searchParams.get("type") === "audio" ||
+                  url.pathname.includes("/audio/") ||
+                  Boolean(prefix && prefix.includes("/audio/")) ||
+                  (targetSegments.length > 0 && targetSegments[0].includes("/audio/"));
   const contentType = isAudio ? "audio/mp2t" : "video/mp2t";
 
   const bundleHeaders = {
@@ -1249,6 +1249,19 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
 
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
+
+  if (request.signal) {
+    if (request.signal.aborted) {
+      writer.close().catch(() => {});
+      return new Response(readable, {
+        status: 200,
+        headers: bundleHeaders
+      });
+    }
+    request.signal.addEventListener("abort", () => {
+      writer.close().catch(() => {});
+    }, { once: true });
+  }
 
   const userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
   const fetchHeaders = {
@@ -1833,8 +1846,9 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       : `&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
 
     const baseUrlStr = baseUrl ? (baseUrl.href || String(baseUrl)) : '';
-    const isAudioBatch = baseUrlStr.includes('/audio') ||
-                         batchSegmentUrls.some(u => typeof u === 'string' && (u.includes('/audio') || /-a\d+\./i.test(u)));
+    const isAudioBatch = baseUrlStr.includes('/audio/') ||
+                         baseUrlStr.endsWith('/audio.m3u8') ||
+                         Boolean(prefix && prefix.includes('/audio/'));
     const audioParam = isAudioBatch ? '&type=audio' : '';
 
     bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}${audioParam}`;
