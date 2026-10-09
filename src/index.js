@@ -2003,6 +2003,14 @@ async function handleScheduleRequest(url, request, eventOrReq) {
                         ep.cover_image?.medium ||
                         (ep.image_route ? `https://reanime.to/${ep.image_route}` : '');
 
+          const titleCombined = `${titleEn} ${titleJp} ${ep.title?.romaji || ''} ${ep.route || ''}`;
+          const isDub = (ep.air_type === 'dub') ||
+                        (/[\(\[]\s*dub\s*[\)\]]|\bdub\b/i.test(titleCombined));
+          const audioType = isDub ? "DUB" : "SUB";
+          const isDelayed = ep.airing_status === 'delayed-air' ||
+                            ep.airing_status === 'delayed' ||
+                            /delayed|postponed|hiatus/i.test(String(ep.status || '') + ' ' + String(ep.airing_status || ''));
+
           shows.push({
             title: titleEn,
             title_jp: titleJp,
@@ -2011,11 +2019,14 @@ async function handleScheduleRequest(url, request, eventOrReq) {
             timestamp: showUnix,
             image: image,
             slug: ep.route || ep.anime_id || '',
-            id: ep.anilist_id || ep.mal_id || ep.anime_id || ''
+            id: ep.anilist_id || ep.mal_id || ep.anime_id || '',
+            is_dub: isDub,
+            audio_type: audioType,
+            is_delayed: isDelayed
           });
         }
 
-        shows.sort((a, b) => a.timestamp - b.timestamp);
+        shows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
         days.push({
           day: dayName,
@@ -2065,6 +2076,10 @@ async function handleScheduleRequest(url, request, eventOrReq) {
         const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
         if (imgMatch) image = imgMatch[1].trim();
 
+        const isDub = /[\(\[]\s*dub\s*[\)\]]|\bdub\b/i.test(titleEn + " " + titleJp + " " + epStr + " " + attrs);
+        const isDelayed = /delayed|postponed|hiatus/i.test(inner + " " + attrs);
+        const audioType = isDub ? "DUB" : "SUB";
+
         shows.push({
           title: titleEn,
           title_jp: titleJp,
@@ -2073,9 +2088,14 @@ async function handleScheduleRequest(url, request, eventOrReq) {
           timestamp: Math.floor(Date.now() / 1000),
           image: image,
           slug: slug,
-          id: ''
+          id: '',
+          is_dub: isDub,
+          audio_type: audioType,
+          is_delayed: isDelayed
         });
       }
+
+      shows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
       const dayTimestamp = Math.floor(Date.now() / 1000) + (weekOffset * 7 * 86400);
       days.push({
