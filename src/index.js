@@ -594,7 +594,7 @@ async function handleRequest(eventOrReq, envParam, ctxParam) {
 
   // 2. ROUTING PIPELINE: Weekly Broadcast Schedule (/schedule)
   if (action === "schedule" || url.pathname === "/schedule") {
-    return await handleScheduleRequest(url);
+    return await handleScheduleRequest(url, request, eventOrReq);
   }
 
   // 3. OBFUSCATED ROUTE: Franchise Tree (/comment?s={slug}&id={anilistId})
@@ -1902,150 +1902,262 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
 }
 
 // -------------------------------------------------------------------------
-// RESOLVER 1: WEEKLY BROADCAST SCHEDULE ROUTER
+// RESOLVER 1: UNIFIED 14-DAY BROADCAST SCHEDULE ROUTER (REANIME V1 API)
 // -------------------------------------------------------------------------
-async function handleScheduleRequest(url) {
-  const inputTime = parseInt(url.searchParams.get("time") || Math.floor(Date.now() / 1000).toString(), 10);
-  const inputTz = parseInt(url.searchParams.get("tz") || "0", 10);
+async function handleScheduleRequest(url, request, eventOrReq) {
+  const tz = url.searchParams.get("tz") || "Asia/Calcutta";
+  const weekParam = url.searchParams.get("week"); // "0", "1", or null (full 14 days)
 
-  const localizedTime = inputTime + (inputTz * 3600);
-  const localizedDate = new Date(localizedTime * 1000);
-  const year = localizedDate.getUTCFullYear();
-  const month = localizedDate.getUTCMonth();
-  const date = localizedDate.getUTCDate();
-  const todayMidnightUtc = Math.floor(Date.UTC(year, month, date) / 1000);
-
-  const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const payload = [];
-
-  for (let i = 0; i < 7; i++) {
-    const timestamp = todayMidnightUtc + (i * 86400);
-    const dayIndex = new Date(timestamp * 1000).getUTCDay();
-    const dayName = daysOfWeek[dayIndex];
-
-    const ajaxUrl = `https://reanime.to/api/v1/schedule?tz=0&time=${timestamp}`;
-    const headers = new Headers({
-      'X-Requested-With': 'XMLHttpRequest',
-      'Referer': 'https://reanime.to/home',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    });
-
-    const shows = [];
+  // Check Cloudflare edge cache first
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  let cacheKey = null;
+  if (cache && request && request.method === 'GET') {
     try {
-      const res = await fetch(ajaxUrl, { headers });
-      if (res.ok) {
-        const data = await res.json();
-        const html = data.result || '';
+      cacheKey = new Request(url.toString(), { method: 'GET' });
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        return cached;
+      }
+    } catch (_) {}
+  }
 
-        const itemRegex = /<a\s+([^>]*class=["'][^"']*item[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
-        let match;
-        while ((match = itemRegex.exec(html)) !== null) {
-          const attrs = match[1];
-          const inner = match[2];
+  const reanimeHeaders = {
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://reanime.to/home",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+  };
 
-          const hrefMatch = attrs.match(/href=["']([^"']*)["']/i);
-          const href = hrefMatch ? hrefMatch[1] : '';
+  const shortMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-          let slug = '';
-          const slugMatch = href.match(/\/watch\/([^\/]+)/i);
-          if (slugMatch) {
-            slug = slugMatch[1];
-          } else {
-            slug = href.substring(href.lastIndexOf('/') + 1);
+  let todayDateStr = '';
+  try {
+    todayDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+  } catch (_) {
+    todayDateStr = new Date().toISOString().slice(0, 10);
+  }
+
+  const parseWeekData = (weekData, weekOffset) => {
+    const days = [];
+    if (!weekData) return days;
+
+    const sched = weekData.schedule || (Array.isArray(weekData) ? weekData : (weekData.data?.schedule || null));
+
+    // 1. Structured JSON parsing (ReAnime v1 standard)
+    if (sched && typeof sched === 'object') {
+      const keys = Array.isArray(sched)
+        ? sched.map((_, i) => String(i))
+        : Object.keys(sched).sort((a, b) => Number(a) - Number(b));
+      for (const k of keys) {
+        const dayObj = sched[k];
+        if (!dayObj) continue;
+        const dayDateStr = dayObj.date; // 'YYYY-MM-DD'
+        let dayTimestamp = 0;
+        let dateTag = '';
+        let dayName = dayObj.day || '';
+
+        if (dayDateStr && dayDateStr.includes('-')) {
+          const [yr, mo, da] = dayDateStr.split('-').map(Number);
+          dayTimestamp = Math.floor(Date.UTC(yr, mo - 1, da) / 1000);
+          dateTag = shortMonths[mo - 1] + ' ' + String(da).padStart(2, '0');
+          if (!dayName) {
+            dayName = daysOfWeek[new Date(Date.UTC(yr, mo - 1, da, 12, 0, 0)).getUTCDay()];
           }
+        } else {
+          dayTimestamp = Math.floor(Date.now() / 1000);
+          dateTag = 'Day ' + (Number(k) + 1);
+        }
 
-          const timeMatch = inner.match(/<div[^>]+class=["']time["'][^>]*>([\s\S]*?)<\/div>/i);
-          const timeStr = timeMatch ? timeMatch[1].replace(/<[^>]*>/g, '').trim() : '';
+        const fullDate = `${dayName}, ${dateTag}`;
+        const isToday = (dayDateStr === todayDateStr);
 
-          let showTimeUnix = timestamp;
-          if (timeStr) {
-            const ampmMatch = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-            const militaryMatch = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-            if (ampmMatch) {
-              let hours = parseInt(ampmMatch[1], 10);
-              const mins = parseInt(ampmMatch[2], 10);
-              const ampm = ampmMatch[3].toUpperCase();
-              if (ampm === 'PM' && hours < 12) hours += 12;
-              else if (ampm === 'AM' && hours === 12) hours = 0;
-              showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
-            } else if (militaryMatch) {
-              const hours = parseInt(militaryMatch[1], 10);
-              const mins = parseInt(militaryMatch[2], 10);
-              showTimeUnix = timestamp + (hours * 3600) + (mins * 60);
+        const shows = [];
+        const episodes = Array.isArray(dayObj.episodes) ? dayObj.episodes : [];
+        for (const ep of episodes) {
+          let showUnix = dayTimestamp;
+          let timeFormatted = '';
+
+          if (ep.episode_date) {
+            const d = new Date(ep.episode_date);
+            showUnix = Math.floor(d.getTime() / 1000);
+            try {
+              timeFormatted = d.toLocaleTimeString('en-US', {
+                timeZone: tz,
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true
+              });
+            } catch (_) {
+              let hours = d.getUTCHours();
+              const minutes = d.getUTCMinutes();
+              const ampm = hours >= 12 ? 'PM' : 'AM';
+              hours = hours % 12 || 12;
+              timeFormatted = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')} ${ampm}`;
             }
           }
 
-          const epMatch = inner.match(/<div[^>]+class=["']ep["'][^>]*>[\s\S]*?<span>([\s\S]*?)<\/span>/i);
-          const epStr = epMatch ? epMatch[1].replace(/<[^>]*>/g, '').trim() : '';
-          const epNumClean = epStr.replace(/^Episode\s+/i, '');
-
-          let titleEn = '';
-          let titleJp = '';
-          const titleMatch = inner.match(/<div[^>]+class=["'][^"']*(title\s+d-title|d-title\s+title)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
-          if (titleMatch) {
-            const titleDivTag = titleMatch[0];
-            titleEn = titleMatch[2].replace(/<[^>]*>/g, '').trim();
-
-            const jpMatch = titleDivTag.match(/data-jp=["']([^"']*)["']/i);
-            if (jpMatch) titleJp = jpMatch[1].trim();
-          }
-
-          let image = '';
-          const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
-          if (imgMatch) image = imgMatch[1].trim();
-
-          const formatTime = (unixSecs) => {
-            const date = new Date(unixSecs * 1000);
-            let hours = date.getUTCHours();
-            const minutes = date.getUTCMinutes();
-            const ampm = hours >= 12 ? 'PM' : 'AM';
-            hours = hours % 12;
-            hours = hours ? hours : 12;
-            const minutesStr = minutes < 10 ? '0' + minutes : minutes;
-            const hoursStr = hours < 10 ? '0' + hours : hours;
-            return `${hoursStr}:${minutesStr} ${ampm}`;
-          };
+          const titleEn = ep.title?.english || ep.title?.user_preferred || ep.title?.romaji || '';
+          const titleJp = ep.title?.native || ep.title?.romaji || '';
+          const image = ep.cover_image?.large ||
+                        ep.cover_image?.extra_large ||
+                        ep.cover_image?.medium ||
+                        (ep.image_route ? `https://reanime.to/${ep.image_route}` : '');
 
           shows.push({
-            time: formatTime(showTimeUnix),
-            timestamp: showTimeUnix,
-            episode: epNumClean,
             title: titleEn,
             title_jp: titleJp,
-            slug: slug,
-            href: href,
-            image: image
+            episode: ep.episode_number != null ? String(ep.episode_number) : '',
+            time: timeFormatted,
+            timestamp: showUnix,
+            image: image,
+            slug: ep.route || ep.anime_id || '',
+            id: ep.anilist_id || ep.mal_id || ep.anime_id || ''
           });
         }
+
+        shows.sort((a, b) => a.timestamp - b.timestamp);
+
+        days.push({
+          day: dayName,
+          date: dateTag,
+          full_date: fullDate,
+          timestamp: dayTimestamp,
+          is_today: isToday,
+          shows: shows
+        });
       }
-    } catch (e) {
-      console.error(`[Worker Schedule] Failed parsing date ${dayName}:`, e);
+      return days;
     }
 
-    payload.push({ day: dayName, timestamp: timestamp, shows: shows });
-  }
+    // 2. HTML Markup Fallback parsing
+    if (typeof weekData.result === 'string') {
+      const html = weekData.result;
+      const shows = [];
+      const itemRegex = /<a\s+([^>]*class=["'][^"']*item[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
+      let match;
+      while ((match = itemRegex.exec(html)) !== null) {
+        const attrs = match[1];
+        const inner = match[2];
 
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const currentDayName = days[new Date(localizedTime * 1000).getUTCDay()];
-  let foundIdx = -1;
-  for (let k = 0; k < payload.length; k++) {
-    if (payload[k].day.toLowerCase() === currentDayName.toLowerCase()) {
-      foundIdx = k;
-      break;
+        const hrefMatch = attrs.match(/href=["']([^"']*)["']/i);
+        const href = hrefMatch ? hrefMatch[1] : '';
+        let slug = '';
+        const slugMatch = href.match(/\/watch\/([^\/]+)/i);
+        slug = slugMatch ? slugMatch[1] : href.substring(href.lastIndexOf('/') + 1);
+
+        const timeMatch = inner.match(/<div[^>]+class=["']time["'][^>]*>([\s\S]*?)<\/div>/i);
+        const timeStr = timeMatch ? timeMatch[1].replace(/<[^>]*>/g, '').trim() : '';
+
+        const epMatch = inner.match(/<div[^>]+class=["']ep["'][^>]*>[\s\S]*?<span>([\s\S]*?)<\/span>/i);
+        const epStr = epMatch ? epMatch[1].replace(/<[^>]*>/g, '').trim() : '';
+        const epNumClean = epStr.replace(/^Episode\s+/i, '');
+
+        let titleEn = '';
+        let titleJp = '';
+        const titleMatch = inner.match(/<div[^>]+class=["'][^"']*(title\s+d-title|d-title\s+title)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+        if (titleMatch) {
+          titleEn = titleMatch[2].replace(/<[^>]*>/g, '').trim();
+          const jpMatch = titleMatch[0].match(/data-jp=["']([^"']*)["']/i);
+          if (jpMatch) titleJp = jpMatch[1].trim();
+        }
+
+        let image = '';
+        const imgMatch = inner.match(/<img[^>]+(?:src|data-src|data-original)=["']([^"']*)["']/i);
+        if (imgMatch) image = imgMatch[1].trim();
+
+        shows.push({
+          title: titleEn,
+          title_jp: titleJp,
+          episode: epNumClean,
+          time: timeStr,
+          timestamp: Math.floor(Date.now() / 1000),
+          image: image,
+          slug: slug,
+          id: ''
+        });
+      }
+
+      const dayTimestamp = Math.floor(Date.now() / 1000) + (weekOffset * 7 * 86400);
+      days.push({
+        day: daysOfWeek[new Date(dayTimestamp * 1000).getUTCDay()],
+        date: 'Week ' + weekOffset,
+        full_date: 'Week ' + weekOffset,
+        timestamp: dayTimestamp,
+        is_today: weekOffset === 0,
+        shows: shows
+      });
+      return days;
     }
-  }
 
-  let reorderedPayload = payload;
-  if (foundIdx !== -1) {
-    reorderedPayload = [
-      ...payload.slice(foundIdx),
-      ...payload.slice(0, foundIdx)
-    ];
-  }
+    return days;
+  };
 
-  return new Response(JSON.stringify(reorderedPayload), {
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-  });
+  try {
+    let unifiedSchedule = [];
+
+    if (weekParam === '0' || weekParam === '1') {
+      // Single week requested explicitly
+      const res = await fetch(`https://reanime.to/api/v1/schedule?tz=${encodeURIComponent(tz)}&week=${weekParam}`, { headers: reanimeHeaders });
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      unifiedSchedule = parseWeekData(data, Number(weekParam));
+    } else {
+      // Default: Concurrent 14-day parallel fetch (Week 0 + Week 1)
+      const [res0, res1] = await Promise.all([
+        fetch(`https://reanime.to/api/v1/schedule?tz=${encodeURIComponent(tz)}&week=0`, { headers: reanimeHeaders }),
+        fetch(`https://reanime.to/api/v1/schedule?tz=${encodeURIComponent(tz)}&week=1`, { headers: reanimeHeaders })
+      ]);
+
+      const [data0, data1] = await Promise.all([
+        res0.ok ? res0.json().catch(() => null) : null,
+        res1.ok ? res1.json().catch(() => null) : null
+      ]);
+
+      const week0Days = parseWeekData(data0, 0);
+      const week1Days = parseWeekData(data1, 1);
+      unifiedSchedule = [...week0Days, ...week1Days];
+    }
+
+    const responseHeaders = {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+      "Cache-Control": "public, max-age=600, s-maxage=1200"
+    };
+
+    const jsonString = JSON.stringify(unifiedSchedule);
+
+    if (cache && cacheKey) {
+      try {
+        const respToCache = new Response(jsonString, {
+          status: 200,
+          headers: responseHeaders
+        });
+        const waitCtx = (eventOrReq && typeof eventOrReq.waitUntil === 'function')
+          ? eventOrReq
+          : (request && typeof request.waitUntil === 'function')
+          ? request
+          : null;
+        if (waitCtx) {
+          waitCtx.waitUntil(cache.put(cacheKey, respToCache));
+        }
+      } catch (_) {}
+    }
+
+    return new Response(jsonString, {
+      status: 200,
+      headers: responseHeaders
+    });
+  } catch (err) {
+    console.error('[Worker Schedule] Failed fetching 14-day schedule:', err);
+    return new Response(JSON.stringify([]), {
+      status: 500,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
 }
 
 // -------------------------------------------------------------------------
