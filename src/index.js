@@ -254,10 +254,10 @@ async function handleRequest(eventOrReq, envParam, ctxParam) {
   let userAgent = request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
   // =========================================================================
-  // 1. HIGH-PRIORITY PROGRESSIVE 10-SEGMENT BUNDLE ROUTER (/api/stream/bundle)
+  // 1. HIGH-PRIORITY PROGRESSIVE BUNDLE ROUTER (/api/stream/bundle & /bundle-stream)
   // Must execute BEFORE any proxy or generic stream parameter matching
   // =========================================================================
-  if (normPath === "/api/stream/bundle" || queryAction === "bundle" || action === "bundle") {
+  if (normPath === "/api/stream/bundle" || normPath === "/bundle-stream" || queryAction === "bundle" || action === "bundle") {
     return await handleBundleRequest(url, request, ctx);
   }
 
@@ -1118,8 +1118,9 @@ async function handleFlixCloudStreamRequest(url, request) {
       finalManifestText = masterManifestText;
     }
 
-    // 4. REWRITE MANIFEST & PROXY SEGMENTS
-    const rewrittenManifest = rewriteM3u8Manifest(finalManifestText, finalManifestUrl, url.origin);
+    // 4. REWRITE MANIFEST & PROXY SEGMENTS (WITH PROGRESSIVE SNOWBALL RAMP)
+    const isLowNet = url.searchParams.get("low_net") === "1" || url.searchParams.get("lowNet") === "true";
+    const rewrittenManifest = rewriteM3u8Manifest(finalManifestText, finalManifestUrl, url.origin, isLowNet);
 
     // 5. API RESPONSE STRUCTURE
     const extractedSubtitles = (rawSubtitles || []).map(s => {
@@ -1335,7 +1336,7 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   }
 
   const prefix = url.searchParams.get("prefix") || url.searchParams.get("base") || "";
-  const rawSegs = url.searchParams.get("segs");
+  const rawSegs = url.searchParams.get("segments") || url.searchParams.get("segs");
   let segmentUrls = [];
 
   if (rawSegs) {
@@ -1359,6 +1360,11 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   // Top-level validation: Guard against empty segment payloads
   if (!segmentUrls || segmentUrls.length === 0) {
     return jsonResponse({ error: "No segments supplied to bundle" }, 400);
+  }
+
+  // Cloudflare Subrequest Guardrail & Memory Protection: Cap at 40 segments max
+  if (segmentUrls.length > 40) {
+    segmentUrls = segmentUrls.slice(0, 40);
   }
 
   const keyUrl = url.searchParams.get("key_url");
@@ -1627,8 +1633,10 @@ async function handleTransparentProxy(srcUrl, request, workerUrl) {
     const isM3u8 = cleanSrcUrl.toLowerCase().includes(".m3u8") || contentType.includes("mpegurl");
 
     if (isM3u8 && upstreamResponse.status === 200 && request.method === "GET") {
+      const isLowNet = (workerUrl && (workerUrl.searchParams.get("low_net") === "1" || workerUrl.searchParams.get("lowNet") === "true")) ||
+                       (request.url && /[?&]low_net=1\b/i.test(request.url));
       const playlistText = await upstreamResponse.text();
-      const rewritten = rewriteM3u8Manifest(playlistText, cleanSrcUrl, workerUrl.origin);
+      const rewritten = rewriteM3u8Manifest(playlistText, cleanSrcUrl, workerUrl.origin, isLowNet);
 
       const playlistHeaders = new Headers(upstreamResponse.headers);
       playlistHeaders.set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8");
@@ -1834,9 +1842,29 @@ function extractCommonPrefixAndSuffixes(urls) {
 }
 
 // -------------------------------------------------------------------------
-// MANIFEST REWRITER (REWRITING SEGMENTS & TAG URIS TO PROXY)
+// PROGRESSIVE "SNOWBALL" BATCH SIZING & MANIFEST REWRITER
 // -------------------------------------------------------------------------
-function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
+function getBatchSize(bundleIndex, isLowNet = false, isAud = false) {
+  if (isAud) return 30; // Audio chunks are small (~40-80KB); bundle heavily
+  if (isLowNet) {
+    // Slow network progression: cap early to prevent connection timeouts & buffer exhaustion
+    if (bundleIndex === 0) return 1;
+    if (bundleIndex === 1) return 3;
+    return 6; // Hard cap for slow connections (< 2.0 Mbps)
+  }
+  // High-speed "snowball" ramp
+  switch (bundleIndex) {
+    case 0: return 1;  // Instant initial frame (TTFB < 250ms)
+    case 1: return 3;  // ~10-12s initial safety cushion
+    case 2: return 6;
+    case 3: return 10;
+    case 4: return 18;
+    case 5: return 28;
+    default: return 38; // Safe ceiling strictly below Cloudflare's 50 subrequest limit (max 40)
+  }
+}
+
+function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin, isLowNetwork = false, isAudio = false) {
   if (!playlistText || typeof playlistText !== 'string') return '';
   const sanitizedText = playlistText.replace(/^\uFEFF/, '').trimStart();
   if (!sanitizedText) return '';
@@ -1851,6 +1879,13 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     }
   } catch (e) {
     return sanitizedText.startsWith('#EXTM3U') ? sanitizedText : `#EXTM3U\n${sanitizedText}`;
+  }
+
+  if (!isLowNetwork && typeof targetUrl === 'string' && /[?&]low_net=1\b/i.test(targetUrl)) {
+    isLowNetwork = true;
+  }
+  if (!isAudio && typeof targetUrl === 'string' && (/[?&]type=audio\b/i.test(targetUrl) || targetUrl.includes('/audio/') || targetUrl.endsWith('/audio.m3u8'))) {
+    isAudio = true;
   }
 
   const cleanWorkerOrigin = (workerOrigin || '').replace(/\/+$/, '');
@@ -1875,12 +1910,22 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
 
   // Master Playlists: Continue rewriting child variant URLs and #EXT-X-MEDIA URIs through the proxy transparently.
   if (isMasterPlaylist) {
+    // Detect multiplexed MPEG-TS:
+    // If streams are multiplexed MPEG-TS (.ts with both audio & video tracks), strip redundant separate #EXT-X-MEDIA:TYPE=AUDIO playlists
+    const isMultiplexedTs = /CODECS="[^"]*(avc1|hvc1)[^"]*,[^"]*mp4a[^"]*"/i.test(sanitizedText) ||
+      (/\.ts(\?|$)/i.test(sanitizedText) && !/URI=["'][^"']*audio[^"']*\.m3u8/i.test(sanitizedText));
+
     const rewrittenLines = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const trimmed = line.trim();
       if (!trimmed) {
         if (rewrittenLines.length > 0) rewrittenLines.push('');
+        continue;
+      }
+
+      // If multiplexed TS, strip redundant separate #EXT-X-MEDIA:TYPE=AUDIO playlists to eliminate dual fetches
+      if (isMultiplexedTs && trimmed.startsWith('#EXT-X-MEDIA:TYPE=AUDIO')) {
         continue;
       }
 
@@ -1891,7 +1936,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
               return `URI="${uri}"`;
             }
             const absUrl = resolveTargetUri(uri);
-            const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}`;
+            const proxiedUrl = `${cleanWorkerOrigin}/?src=${encodeURIComponent(absUrl)}${isLowNetwork ? '&low_net=1' : ''}`;
             return `URI="${proxiedUrl}"`;
           });
           rewrittenLines.push(tagRewritten);
@@ -1908,7 +1953,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       }
 
       const absVariantUrl = resolveTargetUri(trimmed);
-      rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absVariantUrl)}`);
+      rewrittenLines.push(`${cleanWorkerOrigin}/?src=${encodeURIComponent(absVariantUrl)}${isLowNetwork ? '&low_net=1' : ''}`);
     }
 
     while (rewrittenLines.length > 0 && !rewrittenLines[0].trim()) {
@@ -1920,7 +1965,7 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     return rewrittenLines.join('\n').replace(/^\uFEFF/, '').trimStart();
   }
 
-  // 2. Media Playlists: Group consecutive #EXTINF segment tags into 10-segment packet batches.
+  // 2. Media Playlists: Group consecutive #EXTINF segment tags into progressive snowball packet batches.
   // Strip #EXT-X-KEY so Hls.js knows the incoming bundled stream is already decrypted.
   const headerLines = [];
   const segments = [];
@@ -1971,10 +2016,8 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
 
     if (currentExtinf) {
       if (trimmed.startsWith('#')) {
-        // Tag immediately after EXTINF
         continue;
       }
-      // Segment URL line
       const absSegUrl = resolveTargetUri(trimmed);
       segments.push({
         duration: currentDuration,
@@ -1993,7 +2036,6 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     }
 
     if (trimmed.startsWith('#')) {
-      // Rewrite any non-key URI tags (e.g. #EXT-X-MAP) through proxy
       if (/URI=/i.test(trimmed)) {
         const tagRewritten = trimmed.replace(/URI=["']([^"']+)["']/gi, (match, uri) => {
           if ((cleanWorkerOrigin && uri.startsWith(cleanWorkerOrigin)) || uri.startsWith('/?src=')) {
@@ -2015,16 +2057,20 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
     return sanitizedText;
   }
 
-  // Playlist Batch Packaging Algorithm:
-  // Iterate through segment entries. Every 10 segments (or final remainder block),
-  // calculate cumulative #EXTINF duration by summing each segment's exact floating-point duration.
-  const BATCH_SIZE = 10;
+  // Progressive "Snowball" Batch Packaging Algorithm
+  const BATCH_CEILING = 40; // Cloudflare subrequest guardrail
   const bundledLines = [];
   let batchIdx = 0;
   let maxBatchDuration = 0;
+  let segCursor = 0;
 
-  for (let i = 0; i < segments.length; i += BATCH_SIZE) {
-    const batchSegments = segments.slice(i, i + BATCH_SIZE);
+  const baseUrlStr = baseUrl ? (baseUrl.href || String(baseUrl)) : '';
+  const isAudioPlaylist = isAudio || baseUrlStr.includes('/audio/') || baseUrlStr.endsWith('/audio.m3u8');
+
+  while (segCursor < segments.length) {
+    const targetSize = getBatchSize(batchIdx, isLowNetwork, isAudioPlaylist);
+    const batchSize = Math.min(targetSize, segments.length - segCursor, BATCH_CEILING);
+    const batchSegments = segments.slice(segCursor, segCursor + batchSize);
     const batchSegmentUrls = batchSegments.map(s => s.url);
     const cumulativeDuration = batchSegments.reduce((sum, s) => sum + s.duration, 0);
     const exactDuration = parseFloat(cumulativeDuration.toFixed(6));
@@ -2032,25 +2078,21 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
       maxBatchDuration = exactDuration;
     }
 
-    const batchStartSeq = mediaSequence + i;
+    const batchStartSeq = mediaSequence + segCursor;
     const batchKeyUrl = batchSegments[0].keyUrl || activeKeyUrl;
     const batchBaseIv = batchSegments[0].baseIv || activeBaseIv;
 
     // Extract common prefix to keep URL compact and avoid Cloudflare 16KB URL limits
     const { prefix, suffixes } = extractCommonPrefixAndSuffixes(batchSegmentUrls);
-    let bundleUrl;
     const segsParam = (prefix && prefix.length > 8)
       ? `&prefix=${encodeURIComponent(prefix)}&segs=${encodeURIComponent(suffixes.join(','))}`
       : `&segs=${encodeURIComponent(batchSegmentUrls.join(','))}`;
 
-    const baseUrlStr = baseUrl ? (baseUrl.href || String(baseUrl)) : '';
-    const isAudioBatch = baseUrlStr.includes('/audio/') ||
-                         baseUrlStr.endsWith('/audio.m3u8') ||
-                         Boolean(prefix && prefix.includes('/audio/'));
+    const isAudioBatch = isAudioPlaylist || Boolean(prefix && prefix.includes('/audio/'));
     const audioParam = isAudioBatch ? '&type=audio' : '';
+    const lowNetParam = isLowNetwork ? '&low_net=1' : '';
 
-    bundleUrl = `${cleanWorkerOrigin}/api/stream/bundle?batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}${segsParam}${audioParam}`;
-
+    let bundleUrl = `${cleanWorkerOrigin}/bundle-stream?bId=${batchIdx}&batch_id=${batchIdx}&count=${batchSegments.length}&start_seq=${batchStartSeq}&segments=${encodeURIComponent(JSON.stringify(batchSegmentUrls))}${segsParam}${audioParam}${lowNetParam}`;
     if (batchKeyUrl) {
       bundleUrl += `&key_url=${encodeURIComponent(batchKeyUrl)}`;
     }
@@ -2060,6 +2102,8 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
 
     bundledLines.push(`#EXTINF:${exactDuration},`);
     bundledLines.push(bundleUrl);
+
+    segCursor += batchSize;
     batchIdx++;
   }
 
@@ -2097,6 +2141,15 @@ function rewriteM3u8Manifest(playlistText, targetUrl, workerOrigin) {
   }
 
   return outputLines.join('\n').replace(/^\uFEFF/, '').trimStart();
+}
+
+function rewriteManifestToBundles(originalM3u8, proxyBaseUrl, isLowNetwork = false, isAudio = false) {
+  return rewriteM3u8Manifest(originalM3u8, proxyBaseUrl, proxyBaseUrl, isLowNetwork, isAudio);
+}
+
+async function handleBundleStream(request) {
+  const url = new URL(request.url);
+  return await handleBundleRequest(url, request);
 }
 
 // -------------------------------------------------------------------------
