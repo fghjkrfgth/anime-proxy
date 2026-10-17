@@ -1309,6 +1309,89 @@ function getSegmentIv(baseIvHex, seqNum) {
   return iv;
 }
 
+/**
+ * Detect and strip fake image containers (.png, .webp) prepended by RundownCDN/FlixCloud.
+ * Fake PNG signature: \x89PNG\r\n\x1a\n (8 bytes)
+ * Fake WebP signature: RIFF....WEBP (12 bytes)
+ */
+function stripObfuscatedImageHeader(bufferOrUint8) {
+  const bytes = bufferOrUint8 instanceof Uint8Array ? bufferOrUint8 : new Uint8Array(bufferOrUint8);
+  if (!bytes || bytes.byteLength < 16) return bytes;
+
+  // 1. Check for PNG magic: \x89PNG\r\n\x1a\n (8 bytes)
+  const isPng = bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+    bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a;
+
+  // 2. Check for WebP / RIFF container header: RIFF....WEBP (12 bytes)
+  const isWebp = bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && // RIFF
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50; // WEBP
+
+  if (isPng) {
+    let offset = 8;
+    if ((bytes.byteLength - 8) % 16 === 0) {
+      offset = 8;
+    } else if ((bytes.byteLength - 16) % 16 === 0) {
+      offset = 16;
+    } else {
+      const rem = bytes.byteLength % 16;
+      offset = rem > 0 ? rem : 8;
+    }
+    return bytes.subarray(offset);
+  }
+
+  if (isWebp) {
+    let offset = 12;
+    if ((bytes.byteLength - 12) % 16 === 0) {
+      offset = 12;
+    } else if ((bytes.byteLength - 16) % 16 === 0) {
+      offset = 16;
+    } else {
+      const rem = bytes.byteLength % 16;
+      offset = rem > 0 ? rem : 12;
+    }
+    return bytes.subarray(offset);
+  }
+
+  return bytes;
+}
+
+/**
+ * Validate that the decrypted payload begins with standard MPEG-TS sync byte 0x47.
+ * If not, search for the first 0x47 byte aligned at 188-byte intervals.
+ */
+function alignMpegTsPayload(bytes) {
+  if (!bytes || bytes.byteLength === 0) return bytes;
+  if (bytes[0] === 0x47) return bytes;
+
+  const len = bytes.byteLength;
+  const maxSearch = Math.min(len - 1, 188 * 4);
+
+  // Search for 0x47 aligned at 188-byte intervals
+  for (let i = 0; i <= maxSearch; i++) {
+    if (bytes[i] === 0x47) {
+      const p1 = i + 188;
+      const p2 = i + 376;
+      if (p1 < len && bytes[p1] === 0x47) {
+        if (p2 < len && bytes[p2] !== 0x47) {
+          continue; // False positive, check next
+        }
+        return bytes.subarray(i);
+      }
+    }
+  }
+
+  // Fallback: return first 0x47 found
+  for (let i = 0; i <= maxSearch; i++) {
+    if (bytes[i] === 0x47) {
+      return bytes.subarray(i);
+    }
+  }
+
+  return bytes;
+}
+
 // -------------------------------------------------------------------------
 // PROGRESSIVE 10-SEGMENT PACKET BUNDLE STREAMER (WITH IN-WORKER AES-128 DECRYPTION)
 // -------------------------------------------------------------------------
@@ -1491,16 +1574,25 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
         }
 
         if (!cryptoKey) {
-          // For unencrypted streams, pipe the raw readable stream directly through chunk-by-chunk
+          // For unencrypted streams, pipe through chunk-by-chunk with image header stripping & 0x47 alignment
           if (typeof res.body.getReader === 'function') {
             const reader = res.body.getReader();
+            let isFirstChunk = true;
             try {
               while (true) {
                 if (request.signal && request.signal.aborted) break;
-                const { done, value } = await reader.read();
+                const { done, value: rawVal } = await reader.read();
                 if (done) break;
-                if (value && value.byteLength > 0) {
-                  await writer.write(value);
+                if (rawVal && rawVal.byteLength > 0) {
+                  let value = rawVal;
+                  if (isFirstChunk) {
+                    value = stripObfuscatedImageHeader(value);
+                    value = alignMpegTsPayload(value);
+                    isFirstChunk = false;
+                  }
+                  if (value && value.byteLength > 0) {
+                    await writer.write(value);
+                  }
                 }
               }
             } catch (readErr) {
@@ -1510,7 +1602,12 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
           } else {
             const rawBuf = await res.arrayBuffer();
             if (rawBuf && rawBuf.byteLength > 0) {
-              await writer.write(new Uint8Array(rawBuf));
+              let processedBytes = new Uint8Array(rawBuf);
+              processedBytes = stripObfuscatedImageHeader(processedBytes);
+              processedBytes = alignMpegTsPayload(processedBytes);
+              if (processedBytes.byteLength > 0) {
+                await writer.write(processedBytes);
+              }
             }
           }
         } else {
@@ -1527,29 +1624,46 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
           }
 
           const rawBytes = new Uint8Array(encBuffer);
-          const isRawTs = rawBytes[0] === 0x47;
+          // Strip obfuscated image header (e.g., PNG magic \x89PNG\r\n\x1a\n or WebP header RIFF....WEBP)
+          const strippedBytes = stripObfuscatedImageHeader(rawBytes);
+          const isRawTs = strippedBytes[0] === 0x47;
 
           if (!isRawTs) {
             try {
               const segmentIv = getSegmentIv(baseIv, currentSeq);
+
+              // Align buffer length to 16-byte block boundary for AES-CBC decryption
+              const validLen = strippedBytes.byteLength - (strippedBytes.byteLength % 16);
+              const cipherPayload = (validLen === strippedBytes.byteLength && strippedBytes.byteOffset === 0)
+                ? strippedBytes.buffer
+                : strippedBytes.buffer.slice(strippedBytes.byteOffset, strippedBytes.byteOffset + validLen);
+
               const decryptedBuf = await crypto.subtle.decrypt(
                 { name: "AES-CBC", iv: segmentIv },
                 cryptoKey,
-                encBuffer
+                cipherPayload
               );
               if (request.signal && request.signal.aborted) {
                 break;
               }
-              await writer.write(new Uint8Array(decryptedBuf));
+
+              // Validate that decrypted payload begins with MPEG-TS sync byte 0x47; if not, align at 188-byte intervals
+              let decryptedBytes = new Uint8Array(decryptedBuf);
+              decryptedBytes = alignMpegTsPayload(decryptedBytes);
+
+              await writer.write(decryptedBytes);
             } catch (decryptErr) {
               console.error(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
-              if (rawBytes[0] === 0x47) {
+              const fallback = alignMpegTsPayload(strippedBytes);
+              if (fallback[0] === 0x47) {
+                await writer.write(fallback);
+              } else if (rawBytes[0] === 0x47) {
                 await writer.write(rawBytes);
               }
             }
           } else {
-            // Already raw TS, write immediately
-            await writer.write(rawBytes);
+            // Already raw TS, align and write immediately
+            await writer.write(alignMpegTsPayload(strippedBytes));
           }
         }
       }
