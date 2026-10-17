@@ -1414,7 +1414,8 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-    "Cache-Control": "public, max-age=31536000, immutable"
+    "Cache-Control": "public, max-age=3600",
+    "X-Content-Type-Options": "nosniff"
   };
 
   if (request.method === "HEAD") {
@@ -1449,7 +1450,7 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
   };
 
   // Launch async stream task with Web Crypto AES-128 decryption
-  // Writes each unencrypted MPEG-TS chunk immediately without buffering
+  // Asynchronously process each segment and pipe IMMEDIATELY without waiting for subsequent segments
   const streamTask = (async () => {
     try {
       for (let k = 0; k < targetSegments.length; k++) {
@@ -1478,52 +1479,72 @@ async function handleBundleRequest(urlOrReq, reqOrUrl, eventOrReq) {
           break;
         }
 
-        if (!res.ok) {
+        if (!res.ok || !res.body) {
           console.warn(`[Bundle Worker] Segment fetch failed (${res.status}): ${segUrl}`);
           continue;
         }
 
-        const encBuffer = await res.arrayBuffer();
-        if (request.signal && request.signal.aborted) {
-          break;
-        }
-
-        if (!encBuffer || encBuffer.byteLength < 16) {
-          console.warn(`[Bundle Worker] Segment too small (${encBuffer ? encBuffer.byteLength : 0} bytes): ${segUrl}`);
-          continue;
-        }
-
-        const rawBytes = new Uint8Array(encBuffer);
-        const isRawTs = rawBytes[0] === 0x47;
-
-        if (cryptoKey && !isRawTs) {
-          try {
-            const segmentIv = getSegmentIv(baseIv, currentSeq);
-            const decryptedBuf = await crypto.subtle.decrypt(
-              { name: "AES-CBC", iv: segmentIv },
-              cryptoKey,
-              encBuffer
-            );
-            if (request.signal && request.signal.aborted) {
-              break;
+        if (!cryptoKey) {
+          // For unencrypted streams, pipe the raw readable stream directly through chunk-by-chunk
+          if (typeof res.body.getReader === 'function') {
+            const reader = res.body.getReader();
+            try {
+              while (true) {
+                if (request.signal && request.signal.aborted) break;
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.byteLength > 0) {
+                  await writer.write(value);
+                }
+              }
+            } catch (readErr) {
+              if (request.signal && request.signal.aborted) break;
+              throw readErr;
             }
-            await writer.write(new Uint8Array(decryptedBuf));
-          } catch (decryptErr) {
-            console.error(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
-            if (rawBytes[0] === 0x47) {
-              await writer.write(rawBytes);
+          } else {
+            const rawBuf = await res.arrayBuffer();
+            if (rawBuf && rawBuf.byteLength > 0) {
+              await writer.write(new Uint8Array(rawBuf));
             }
           }
         } else {
-          // If raw TS or cryptoKey unavailable, write raw buffer directly
-          if (!cryptoKey && !isRawTs) {
-            const hexHead = Array.from(rawBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
-            console.warn(`[Bundle Worker] cryptoKey unavailable and not raw TS (seq ${currentSeq}), first 16 bytes: ${hexHead}`);
-          }
+          // If AES decryption is required, decrypt each segment individually in memory
+          // and write it to the stream immediately
+          const encBuffer = await res.arrayBuffer();
           if (request.signal && request.signal.aborted) {
             break;
           }
-          await writer.write(rawBytes);
+
+          if (!encBuffer || encBuffer.byteLength < 16) {
+            console.warn(`[Bundle Worker] Segment too small (${encBuffer ? encBuffer.byteLength : 0} bytes): ${segUrl}`);
+            continue;
+          }
+
+          const rawBytes = new Uint8Array(encBuffer);
+          const isRawTs = rawBytes[0] === 0x47;
+
+          if (!isRawTs) {
+            try {
+              const segmentIv = getSegmentIv(baseIv, currentSeq);
+              const decryptedBuf = await crypto.subtle.decrypt(
+                { name: "AES-CBC", iv: segmentIv },
+                cryptoKey,
+                encBuffer
+              );
+              if (request.signal && request.signal.aborted) {
+                break;
+              }
+              await writer.write(new Uint8Array(decryptedBuf));
+            } catch (decryptErr) {
+              console.error(`[Bundle Worker] Decryption failed for seq ${currentSeq}:`, decryptErr?.message || decryptErr);
+              if (rawBytes[0] === 0x47) {
+                await writer.write(rawBytes);
+              }
+            }
+          } else {
+            // Already raw TS, write immediately
+            await writer.write(rawBytes);
+          }
         }
       }
     } catch (err) {
