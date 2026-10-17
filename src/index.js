@@ -609,6 +609,11 @@ async function handleRequest(eventOrReq, envParam, ctxParam) {
     return await handleServerListRequest(url);
   }
 
+  // 4.5 SANITIZED EPISODE ROSTER ROUTE (/api/episodes or ?action=episodes)
+  if (normPath === "/api/episodes" || queryAction === "episodes" || action === "episodes") {
+    return await handleEpisodeListRequest(url, userAgent, ctx);
+  }
+
   // 5. TRANSPARENT PROXY ENGINE (For .ts segments, sub-playlists, keys, fonts, subtitles)
   const srcUrl = url.searchParams.get("src");
   if (srcUrl && action !== "proxy_caption") {
@@ -672,6 +677,178 @@ async function handleServerListRequest(url) {
   } catch (err) {
     return jsonResponse({ success: true, servers: [], error: err.message });
   }
+}
+
+// -------------------------------------------------------------------------
+// SANITIZED EPISODE ROSTER ENGINE (/api/episodes)
+// Strict Filtering, Confirmed Aired Capping & Deduplication
+// -------------------------------------------------------------------------
+async function handleEpisodeListRequest(url, userAgent, ctx) {
+  const animeId = url.searchParams.get("id") || url.searchParams.get("animeId") || url.searchParams.get("slug") || url.searchParams.get("s");
+  const seasonId = url.searchParams.get("seasonId") || url.searchParams.get("season");
+
+  if (!animeId || typeof animeId !== 'string' || !animeId.trim()) {
+    return jsonResponse({ success: false, error: "Missing anime identifier" }, 400);
+  }
+
+  const cleanId = animeId.trim();
+  const isNumeric = /^\d+$/.test(cleanId);
+  const now = Date.now();
+  let episodes = [];
+  let confirmedMaxEp = Infinity;
+
+  // 1. Strict Filtering for Playable Episodes from Upstream Sources (ReAnime)
+  if (!isNumeric) {
+    try {
+      const reanimeUrl = `https://reanime.to/api/v1/anime/${encodeURIComponent(cleanId)}/episodes?limit=1000`;
+      const res = await fetch(reanimeUrl, {
+        headers: {
+          "Referer": "https://reanime.to/",
+          "User-Agent": userAgent
+        }
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const rawList = Array.isArray(json?.data) ? json.data : (Array.isArray(json) ? json : []);
+        for (const ep of rawList) {
+          if (!ep) continue;
+          // Filter out unreleased, coming-soon, disabled, or non-playable
+          const isPlayable = ep.playable !== false &&
+            ep.status !== 'unreleased' &&
+            ep.status !== 'coming-soon' &&
+            ep.status !== 'disabled' &&
+            ep.is_available !== false;
+          const epId = ep.episodeId || ep.id || ep['data-id'];
+          const epNum = Number(ep.episode_number || ep.episode || ep.number);
+
+          // Strip dummy entries whose identifiers are null, undefined, or empty strings
+          if (!epId || typeof epId !== 'string' || !epId.trim() || !isPlayable || isNaN(epNum) || epNum <= 0) continue;
+          if (ep.aired && new Date(ep.aired).getTime() > now + 60000) continue;
+
+          episodes.push({
+            episode_number: epNum,
+            id: String(epId).trim(),
+            title: ep.title || `Episode ${epNum}`,
+            is_available: true,
+            thumbnail: ep.thumbnail || '',
+            aired: ep.aired || null,
+            is_filler: Boolean(ep.is_filler)
+          });
+        }
+      }
+    } catch (err) {
+      console.warn("[Backend Episodes] Upstream ReAnime fetch failed:", err);
+    }
+  }
+
+  // 2. Cap by Confirmed Released Count (AniList & AniZip)
+  if (episodes.length === 0) {
+    let aniData = null;
+    try {
+      const anilistQuery = isNumeric
+        ? `query ($id: Int) { Media (id: $id) { id status episodes nextAiringEpisode { episode airingAt } } }`
+        : `query ($search: String) { Media (search: $search, type: ANIME) { id status episodes nextAiringEpisode { episode airingAt } } }`;
+      const variables = isNumeric ? { id: parseInt(cleanId, 10) } : { search: cleanId.replace(/-[a-z0-9]+$/i, '').replace(/-/g, ' ') };
+
+      const aniRes = await fetch("https://graphql.anilist.co", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": userAgent },
+        body: JSON.stringify({ query: anilistQuery, variables })
+      });
+      if (aniRes.ok) {
+        const json = await aniRes.json();
+        aniData = json?.data?.Media;
+      }
+    } catch (e) {
+      console.warn("[Backend Episodes] AniList metadata fetch failed:", e);
+    }
+
+    if (aniData) {
+      if (aniData.status === 'RELEASING' && aniData.nextAiringEpisode?.episode) {
+        confirmedMaxEp = Math.max(0, aniData.nextAiringEpisode.episode - 1);
+      } else if (aniData.status === 'NOT_YET_RELEASED') {
+        confirmedMaxEp = 0;
+      } else if (aniData.episodes) {
+        confirmedMaxEp = aniData.episodes;
+      } else if (aniData.id === 21) {
+        confirmedMaxEp = 1180;
+      }
+    }
+
+    const anilistId = aniData?.id || (isNumeric ? parseInt(cleanId, 10) : null);
+    let aniZipEpisodes = null;
+    if (anilistId) {
+      try {
+        const zipRes = await fetch(`https://api.ani.zip/mappings?anilist_id=${anilistId}`);
+        if (zipRes.ok) {
+          const zipJson = await zipRes.json();
+          aniZipEpisodes = zipJson?.episodes;
+        }
+      } catch (e) {
+        console.warn("[Backend Episodes] AniZip mapping fetch failed:", e);
+      }
+    }
+
+    if (aniZipEpisodes && typeof aniZipEpisodes === 'object') {
+      for (const [key, ep] of Object.entries(aniZipEpisodes)) {
+        const epNum = parseInt(key, 10);
+        if (isNaN(epNum) || epNum <= 0) continue;
+        if (epNum > confirmedMaxEp) continue;
+        if (ep.airDateUtc && new Date(ep.airDateUtc).getTime() > now) continue;
+
+        episodes.push({
+          episode_number: epNum,
+          id: `ep-${epNum}`,
+          title: (ep.title && (ep.title.en || ep.title.ja || ep.title['x-jat'])) || `Episode ${epNum}`,
+          is_available: true,
+          thumbnail: ep.image || '',
+          aired: ep.airDateUtc || ep.airdate || null,
+          is_filler: false
+        });
+      }
+    } else if (confirmedMaxEp > 0 && confirmedMaxEp !== Infinity) {
+      for (let i = 1; i <= confirmedMaxEp; i++) {
+        episodes.push({
+          episode_number: i,
+          id: `ep-${i}`,
+          title: `Episode ${i}`,
+          is_available: true
+        });
+      }
+    }
+  }
+
+  // 3. Deduplicate entries by episode_number & Sort strictly in numerical order
+  const dedupMap = new Map();
+  for (const ep of episodes) {
+    if (!dedupMap.has(ep.episode_number)) {
+      dedupMap.set(ep.episode_number, ep);
+    } else {
+      const existing = dedupMap.get(ep.episode_number);
+      if ((!existing.id || existing.id.startsWith('ep-')) && ep.id && !ep.id.startsWith('ep-')) {
+        dedupMap.set(ep.episode_number, ep);
+      }
+    }
+  }
+
+  const finalEpisodes = Array.from(dedupMap.values()).sort((a, b) => a.episode_number - b.episode_number);
+
+  const responsePayload = {
+    success: true,
+    total_available: finalEpisodes.length,
+    episodes: finalEpisodes
+  };
+
+  return new Response(JSON.stringify(responsePayload), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "public, max-age=300, s-maxage=300",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-Requested-With, *"
+    }
+  });
 }
 
 // -------------------------------------------------------------------------
